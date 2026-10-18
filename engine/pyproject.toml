@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.15.0,<2"]
+build-backend = "maturin"
+
+[project]
+name = "wright-arctic-engine"
+description = "Typed Rust bindings for Wright Arctic."
+requires-python = ">=3.14"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Typing :: Typed",
+]
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "engine._core"
+python-source = "python"
+include = [{ path = "rust-toolchain.toml", format = "sdist" }]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "rust-toolchain.toml" },
+    { file = "src/**/*.rs" },
+    { file = "python/**/*.py" },
+    { file = "python/**/*.pyi" },
+    { file = "python/**/py.typed" },
+]

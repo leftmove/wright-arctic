@@ -1,0 +1,27 @@
+[package]
+name = "wright-arctic-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Typed native engine for Wright Arctic."
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+stubgen = ["dep:pyo3-stub-gen"]
+
+[dependencies]
+pyo3 = "0.29.3"
+pyo3-stub-gen = { version = "0.23.1", optional = true }
+
+[[bin]]
+name = "generate_stubs"
+required-features = ["stubgen"]
+test = false
+bench = false
+
+[lints.rust]
+unsafe_code = "forbid"

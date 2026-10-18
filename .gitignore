@@ -1,0 +1,24 @@
+# Python and native build outputs
+__pycache__/
+*.py[oc]
+*.so
+*.dylib
+*.pyd
+build/
+dist/
+wheels/
+*.egg-info
+target/
+
+# Environments and tool caches
+.venv/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets
+.env*
+!.env.example
+.secrets/
+
+# macOS
+.DS_Store
