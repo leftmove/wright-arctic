@@ -76,6 +76,7 @@ jobs:
         id: wheel
         run: |
           set -eu
+          sudo chown -R "$(id -u):$(id -g)" engine
           mkdir -p dist/vercel
           found=0
           wheel=""
