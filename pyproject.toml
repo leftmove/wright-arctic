@@ -1,11 +1,13 @@
 [project]
 name = "wright-arctic"
 version = "0.1.0"
-description = "FastAPI application with a typed Rust engine."
+description = "Platform for Wright."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "boto3>=1.40,<2",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.146.0,<1",
+    "pillow>=13,<14",
     "pydantic>=2.14.1,<3",
     "pydantic-settings>=2.16.0,<3",
     "wright-arctic-engine",
@@ -13,6 +15,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "boto3-stubs[s3]>=1.43.114,<2",
     "maturin>=1.15.0,<2",
     "mypy>=2.4.0,<3",
     "ruff>=0.17.1,<0.18",
