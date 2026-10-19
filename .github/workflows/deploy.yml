@@ -1,0 +1,153 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  current:
+    name: Keep the latest main commit
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      || (
+        github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.head_branch == 'main'
+      )
+    runs-on: ubuntu-24.04
+    outputs:
+      deploy: ${{ steps.gate.outputs.deploy }}
+      sha: ${{ steps.gate.outputs.sha }}
+    steps:
+      - name: Skip a superseded commit
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          sha="${{ github.event.workflow_run.head_sha || github.sha }}"
+          latest="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          if [ "$sha" = "$latest" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping ${sha}; main is ${latest}."
+          fi
+
+  deploy:
+    name: Build the engine wheel and deploy
+    needs: current
+    if: needs.current.outputs.deploy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.current.outputs.sha }}
+          persist-credentials: false
+
+      - name: Build the Linux engine wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: build
+          target: x86_64
+          manylinux: "2_28"
+          rust-toolchain: "1.99.1"
+          maturin-version: "v1.15.0"
+          working-directory: engine
+          args: --release --locked --interpreter python3.14 --out dist
+
+      - name: Keep the CPython 3.14 manylinux wheel
+        id: wheel
+        run: |
+          set -eu
+          mkdir -p dist/vercel
+          found=0
+          wheel=""
+          for candidate in engine/dist/*.whl dist/*.whl; do
+            [ -f "$candidate" ] || continue
+            base="$(basename "$candidate")"
+            case "$base" in
+              *cp314-cp314-manylinux_2_28_x86_64*)
+                wheel="$candidate"
+                found=$((found + 1))
+                ;;
+            esac
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "Expected one CPython 3.14 manylinux_2_28 x86_64 wheel, found ${found}."
+            find engine dist -name '*.whl' -print || true
+            exit 1
+          fi
+          destination="dist/vercel/$(basename "$wheel")"
+          mv "$wheel" "$destination"
+          echo "path=${destination}" >> "$GITHUB_OUTPUT"
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.1"
+          enable-cache: true
+
+      - name: Install the engine from the wheel
+        env:
+          ENGINE_WHEEL: ${{ steps.wheel.outputs.path }}
+        run: |
+          set -eu
+          python3 - "$ENGINE_WHEEL" <<'PY'
+          import sys
+          from pathlib import Path
+
+          wheel = sys.argv[1]
+          path = Path("pyproject.toml")
+          text = path.read_text()
+          workspace = '[tool.uv.workspace]\nmembers = ["engine"]\n\n'
+          source = "wright-arctic-engine = { workspace = true }"
+          version_pin = 'required-version = ">=0.13.1"\n'
+          if workspace not in text or source not in text or version_pin not in text:
+              raise SystemExit("pyproject.toml no longer has the expected engine source")
+          text = text.replace(workspace, "", 1)
+          text = text.replace(
+              source,
+              f'wright-arctic-engine = {{ path = "{wheel}" }}',
+              1,
+          )
+          text = text.replace(
+              version_pin,
+              version_pin
+              + 'environments = ["sys_platform == \'linux\' and platform_machine == \'x86_64\'"]\n',
+              1,
+          )
+          path.write_text(text)
+          PY
+          uv lock
+          rm -rf engine
+
+      - name: Install the Vercel CLI
+        run: npm install --prefix "$RUNNER_TEMP/vercel-cli" vercel@64.7.0
+
+      - name: Pull the production project settings
+        run: |
+          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" pull --yes --environment=production
+
+      - name: Build the FastAPI function
+        run: |
+          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" build --prod
+
+      - name: Deploy the prebuilt function
+        run: |
+          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" deploy --prebuilt --prod
