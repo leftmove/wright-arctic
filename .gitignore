@@ -9,9 +9,11 @@ dist/
 wheels/
 *.egg-info
 target/
+target
 
 # Environments and tool caches
 .venv/
+.venv
 .mypy_cache/
 .ruff_cache/
 
