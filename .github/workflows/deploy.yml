@@ -163,4 +163,4 @@ jobs:
         env:
           DEPLOYMENT: ${{ steps.staged.outputs.deployment }}
         run: |
-          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" promote "$DEPLOYMENT" --yes
+          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" promote "$DEPLOYMENT" --scope "$VERCEL_ORG_ID" --yes
