@@ -163,4 +163,39 @@ jobs:
         env:
           DEPLOYMENT: ${{ steps.staged.outputs.deployment }}
         run: |
-          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" promote "$DEPLOYMENT" --scope "$VERCEL_ORG_ID" --yes
+          # Use the project API: the CI token has deployment permissions but
+          # no user identity for the interactive promote command's lookup.
+          node --input-type=module <<'JS'
+          import { execFileSync } from 'node:child_process';
+
+          const cli = `${process.env.RUNNER_TEMP}/vercel-cli/node_modules/.bin/vercel`;
+          const team = process.env.VERCEL_ORG_ID;
+          const project = process.env.VERCEL_PROJECT_ID;
+          function api(path, method = 'GET') {
+            const args = ['api', `${path}?teamId=${team}`, '--method', method, '--raw'];
+            if (method === 'POST') args.push('--input', '-');
+            return execFileSync(cli, args, {
+              encoding: 'utf8', input: method === 'POST' ? '{}' : undefined,
+              stdio: ['pipe', 'pipe', 'inherit'],
+            });
+          }
+          const host = new URL(process.env.DEPLOYMENT).hostname;
+          const deployment = JSON.parse(api(`/v13/deployments/${host}`));
+          if (deployment.projectId !== project || deployment.target !== 'production' ||
+              !/^dpl_[A-Za-z0-9]+$/.test(deployment.id)) {
+            throw new Error('Refusing to promote a deployment outside this production project');
+          }
+          api(`/v10/projects/${project}/promote/${deployment.id}`, 'POST');
+          for (let attempt = 0; attempt < 20; attempt++) {
+            const state = JSON.parse(api(`/v9/projects/${project}`)).lastAliasRequest;
+            if (state?.toDeploymentId === deployment.id) {
+              if (state.jobStatus === 'succeeded') {
+                console.log('Production promotion verified.');
+                process.exit(0);
+              }
+              if (state.jobStatus === 'failed') throw new Error('Production promotion failed');
+            }
+            await new Promise(resolve => setTimeout(resolve, 3000));
+          }
+          throw new Error('Production promotion timed out');
+          JS
