@@ -149,6 +149,16 @@ jobs:
         run: |
           "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" build --prod
 
-      - name: Deploy the prebuilt function
+      - name: Stage and verify the prebuilt production function
+        id: staged
         run: |
-          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" deploy --prebuilt --prod
+          set -eu
+          deployment="$("$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" deploy --prebuilt --prod --skip-domain)"
+          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" curl /health --deployment "$deployment" -- --fail --silent --show-error --max-time 60 --retry 2 --retry-all-errors
+          echo "deployment=${deployment}" >> "$GITHUB_OUTPUT"
+
+      - name: Promote the verified function
+        env:
+          DEPLOYMENT: ${{ steps.staged.outputs.deployment }}
+        run: |
+          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" promote "$DEPLOYMENT" --yes

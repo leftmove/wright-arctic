@@ -1,5 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "build": {
+    "env": {
+      "VERCEL_PYTHON_DISABLE_RUNTIME_INSTALL": "1"
+    }
+  },
   "git": {
     "deploymentEnabled": false
   }

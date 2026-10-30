@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import BinaryIO
 from uuid import UUID, uuid4
 
+import imagecodecs
 from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
 
 from app.accounts import Account
@@ -45,6 +46,10 @@ class ImageService:
     def __init__(
         self, store: S3ImageStore, pipeline: ImagePipeline | None = None
     ) -> None:
+        # Load the native codec at startup so deployment health checks catch
+        # incompatible/missing wheels before publishing any delivery URLs.
+        if not imagecodecs.JPEGXL.available:
+            raise RuntimeError("JPEG XL codec is unavailable")
         self._store = store
         self._pipeline = replace(pipeline or ImagePipeline(), output_format="jxl")
 
