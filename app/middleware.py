@@ -3,12 +3,13 @@
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.request_paths import route_path
 from app.schemas import error_body
 from app.services.images.errors import ImageTooLarge
 
 
 class ImageUploadLimitMiddleware:
-    """Stop POST /images once the body exceeds the upload budget.
+    """Stop image uploads once the body exceeds the upload budget.
 
     Starlette's multipart part limit does not apply to file fields. The body
     is read here, up to the budget, and replayed to the application. A limit
@@ -24,7 +25,7 @@ class ImageUploadLimitMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if (
             scope["type"] != "http"
-            or scope["method"] != "POST"
+            or scope["method"] not in {"POST", "PUT"}
             or not _is_image_create(scope)
         ):
             await self._app(scope, receive, send)
@@ -58,8 +59,10 @@ class _ClientDisconnected(Exception):
 
 
 def _is_image_create(scope: Scope) -> bool:
-    path = scope.get("path")
-    return isinstance(path, str) and path.rstrip("/") == "/images"
+    path = route_path(scope).rstrip("/")
+    return path == "/images" or (
+        path.startswith("/images/") and path.endswith("/portrait")
+    )
 
 
 def _content_lengths(scope: Scope) -> list[int]:

@@ -3,11 +3,12 @@
 import os
 from functools import lru_cache
 from typing import Annotated, cast
-from uuid import UUID
 
-from fastapi import Depends, Header, Request
+from fastapi import Depends, Request, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.accounts import Account
+from app.authentication.http import authenticate_request
 from app.services.images.errors import StorageUnconfigured
 from app.services.images.service import ImageService
 from app.settings import Settings
@@ -20,21 +21,20 @@ def get_settings() -> Settings:
     return Settings(_secrets_dir=os.getenv("WRIGHT_ARCTIC_SECRETS_DIR"))
 
 
-def get_current_account(
-    account_id: Annotated[
-        UUID,
-        Header(
-            alias="X-Account-Id",
-            convert_underscores=False,
-            description=(
-                "Temporary account id until authentication is enabled. "
-                "This header is not an authorization check."
-            ),
-        ),
-    ],
+_bearer = HTTPBearer(
+    auto_error=False,
+    scheme_name="NativeAccessToken",
+    description="Access JWT from the native app's AuthManager.get_valid_access_token(false).",
+)
+
+
+async def get_current_account(
+    request: Request,
+    _credential: Annotated[HTTPAuthorizationCredentials | None, Security(_bearer)],
 ) -> Account:
-    """Return the stub account named by the request header."""
-    return Account(id=account_id)
+    """Return the verified identity, reusing the middleware's request-local result."""
+    resources = cast(AppResources, request.app.state.resources)
+    return await authenticate_request(request, resources.authentication)
 
 
 def require_image_service(request: Request) -> ImageService:

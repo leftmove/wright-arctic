@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from app.authentication.service import AuthenticationService
 from app.services.images.service import ImageService
 
 
@@ -9,9 +10,14 @@ from app.services.images.service import ImageService
 class AppResources:
     """Services that outlive a single request."""
 
+    authentication: AuthenticationService | None
     image_service: ImageService | None
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Release clients held for the life of the process."""
-        if self.image_service is not None:
-            self.image_service.close()
+        try:
+            if self.authentication is not None:
+                await self.authentication.close()
+        finally:
+            if self.image_service is not None:
+                self.image_service.close()

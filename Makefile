@@ -1,7 +1,7 @@
 UV ?= uv
 
 .DEFAULT_GOAL := help
-.PHONY: help sync dev run stubs check-stubs check format build
+.PHONY: help sync dev run stubs check-stubs check test format build
 
 help:
 	@printf '%s\n' \
@@ -10,7 +10,8 @@ help:
 	  'make run          Start the production server' \
 	  'make stubs        Regenerate native Python type stubs' \
 	  'make check-stubs  Verify generated stubs are current' \
-	  'make check        Run Python, Rust, and binding checks' \
+	  'make check        Run Python, Rust, binding, and security checks' \
+	  'make test         Run backend security regression tests' \
 	  'make format       Format Python and Rust' \
 	  'make build        Build the engine source distribution and wheel'
 
@@ -41,10 +42,14 @@ check:
 	$(UV) run ruff check
 	$(UV) run ruff format --check
 	$(UV) run mypy
+	$(MAKE) test
 	$(UV) run --directory engine cargo fmt --all -- --check
 	$(UV) run --directory engine cargo clippy --locked --all-targets --all-features -- -D warnings
 	$(MAKE) check-stubs
 	$(UV) run python -m mypy.stubtest engine
+
+test:
+	$(UV) run python -m unittest discover -s app/tests
 
 format:
 	$(UV) run ruff check --fix

@@ -20,6 +20,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import SecretStr
 
+from app.accounts import Account
 from app.services.images.errors import (
     ImageNotFound,
     StorageInvalid,
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
         HeadObjectOutputTypeDef,
         ListObjectsV2OutputTypeDef,
         ObjectTypeDef,
+        PutObjectRequestTypeDef,
     )
 
 logger = logging.getLogger(__name__)
@@ -52,7 +54,7 @@ _LIST_PAGE_SIZE = 1000
 _MAX_LIST_PAGES = 20
 _OBJECT_KEY = re.compile(
     r"^accounts/"
-    r"(?P<account>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r"(?P<account>[0-9a-f]{64})"
     r"/images/"
     r"(?P<image>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
     r"\.(?P<ext>avif|webp)$"
@@ -92,54 +94,65 @@ class S3ImageStore:
         self._client.close()
 
     def put_image(
-        self, account_id: UUID, image_id: UUID, image: ProcessedImage
-    ) -> None:
+        self,
+        account: Account,
+        image_id: UUID,
+        image: ProcessedImage,
+        *,
+        if_absent: bool = False,
+    ) -> bool:
         """Write one recompressed image."""
         if len(image.data) > MAX_STORED_BYTES:
             raise StoredImageTooLarge()
-        key = object_key(account_id, image_id, image.extension)
+        key = object_key(account, image_id, image.extension)
         cache_control = (
             "public, max-age=31536000, immutable"
             if self._public_base_url is not None
             else "private, max-age=86400"
         )
 
-        def _put() -> None:
-            self._client.put_object(
-                Bucket=self._bucket,
-                Key=key,
-                Body=image.data,
-                ContentType=image.media_type,
-                CacheControl=cache_control,
-                ContentDisposition="inline",
-                Metadata={
-                    "width": str(image.width),
-                    "height": str(image.height),
-                },
-            )
+        def _put() -> bool:
+            request: PutObjectRequestTypeDef = {
+                "Bucket": self._bucket,
+                "Key": key,
+                "Body": image.data,
+                "ContentType": image.media_type,
+                "CacheControl": cache_control,
+                "ContentDisposition": "inline",
+                "Metadata": {"width": str(image.width), "height": str(image.height)},
+            }
+            if if_absent:
+                request["IfNoneMatch"] = "*"
+            try:
+                self._client.put_object(**request)
+            except ClientError as exc:
+                if if_absent and _http_status(exc) == 412:
+                    return False
+                raise
+            return True
 
-        self._invoke(_put)
+        return self._invoke(_put)
 
     def discard_image(
-        self, account_id: UUID, image_id: UUID, extension: ImageExtension
+        self, account: Account, image_id: UUID, extension: ImageExtension
     ) -> None:
         """Delete an exact key written by this process."""
-        key = object_key(account_id, image_id, extension)
+        key = object_key(account, image_id, extension)
 
         def _delete() -> None:
             self._client.delete_object(Bucket=self._bucket, Key=key)
 
         self._invoke(_delete)
 
-    def delete_image(self, account_id: UUID, image_id: UUID) -> None:
+    def delete_image(self, account: Account, image_id: UUID) -> None:
         """Delete one stored image, or raise when it is not in the account."""
-        stored = self.get_image(account_id, image_id)
-        self.discard_image(account_id, image_id, stored.extension)
+        stored = self.get_image(account, image_id)
+        self.discard_image(account, image_id, stored.extension)
 
-    def get_image(self, account_id: UUID, image_id: UUID) -> ImageObject:
+    def get_image(self, account: Account, image_id: UUID) -> ImageObject:
         """Read metadata for one stored image."""
         for extension in ("avif", "webp"):
-            key = object_key(account_id, image_id, extension)
+            key = object_key(account, image_id, extension)
 
             def _head(object_key: str = key) -> HeadObjectOutputTypeDef:
                 return self._client.head_object(Bucket=self._bucket, Key=object_key)
@@ -151,7 +164,7 @@ class S3ImageStore:
             return _object_from_head(image_id, extension, response)
         raise ImageNotFound()
 
-    def list_images(self, account_id: UUID, *, limit: int) -> list[ImageObject]:
+    def list_images(self, account: Account, *, limit: int) -> list[ImageObject]:
         """Return up to `limit` images for an account, oldest first.
 
         Listing order is lexicographic, so the prefix is read and then sorted
@@ -159,30 +172,30 @@ class S3ImageStore:
         """
         if limit < 1:
             return []
-        found = list(self._iter_images(account_id))
+        found = list(self._iter_images(account))
         found.sort(key=_listing_order)
         return found[:limit]
 
-    def count_images(self, account_id: UUID, *, maximum: int) -> int:
+    def count_images(self, account: Account, *, maximum: int) -> int:
         """Count stored images, stopping once `maximum` is reached."""
         if maximum < 1:
             return 0
         counted = 0
-        for _image in self._iter_images(account_id):
+        for _image in self._iter_images(account):
             counted += 1
             if counted >= maximum:
                 break
         return counted
 
-    def _iter_images(self, account_id: UUID) -> Iterator[ImageObject]:
+    def _iter_images(self, account: Account) -> Iterator[ImageObject]:
         token: str | None = None
-        prefix = account_prefix(account_id)
+        prefix = account_prefix(account)
         for _ in range(_MAX_LIST_PAGES):
             page = self._list_page(prefix, _LIST_PAGE_SIZE, token)
             contents = page.get("Contents")
             if contents is not None:
                 for item in contents:
-                    image = _object_from_listing(account_id, item)
+                    image = _object_from_listing(account, item)
                     if image is not None:
                         yield image
             if not page.get("IsTruncated", False):
@@ -197,10 +210,10 @@ class S3ImageStore:
             token = next_token
 
     def url_for(
-        self, account_id: UUID, image_id: UUID, extension: ImageExtension
+        self, account: Account, image_id: UUID, extension: ImageExtension
     ) -> str:
         """Return the URL a client uses to fetch the object."""
-        key = object_key(account_id, image_id, extension)
+        key = object_key(account, image_id, extension)
         if self._public_base_url is not None:
             return f"{self._public_base_url}/{quote(key, safe='/')}"
 
@@ -293,14 +306,14 @@ def build_image_store(settings: Settings) -> S3ImageStore | None:
     )
 
 
-def object_key(account_id: UUID, image_id: UUID, extension: ImageExtension) -> str:
+def object_key(account: Account, image_id: UUID, extension: ImageExtension) -> str:
     """Return the bucket key for one image."""
-    return f"{account_prefix(account_id)}{image_id}.{extension}"
+    return f"{account_prefix(account)}{image_id}.{extension}"
 
 
-def account_prefix(account_id: UUID) -> str:
+def account_prefix(account: Account) -> str:
     """Return the key prefix that contains one account's images."""
-    return f"accounts/{account_id}/images/"
+    return f"accounts/{account.storage_key}/images/"
 
 
 def _secret_text(value: SecretStr | None) -> str | None:
@@ -336,13 +349,13 @@ def _object_from_head(
     )
 
 
-def _object_from_listing(account_id: UUID, item: ObjectTypeDef) -> ImageObject | None:
+def _object_from_listing(account: Account, item: ObjectTypeDef) -> ImageObject | None:
     key = item.get("Key")
     size = item.get("Size")
     modified = item.get("LastModified")
     if key is None or size is None or size < 1 or modified is None:
         return None
-    parsed = _parse_object_key(key, account_id)
+    parsed = _parse_object_key(key, account)
     if parsed is None:
         return None
     image_id, extension = parsed
@@ -355,16 +368,16 @@ def _object_from_listing(account_id: UUID, item: ObjectTypeDef) -> ImageObject |
     )
 
 
-def _parse_object_key(key: str, account_id: UUID) -> tuple[UUID, ImageExtension] | None:
+def _parse_object_key(key: str, account: Account) -> tuple[UUID, ImageExtension] | None:
     match = _OBJECT_KEY.fullmatch(key)
     if match is None:
         return None
     try:
-        owner = UUID(match.group("account"))
+        owner = match.group("account")
         image_id = UUID(match.group("image"))
     except ValueError:
         return None
-    if owner != account_id:
+    if owner != account.storage_key:
         return None
     extension = match.group("ext")
     if extension == "avif":

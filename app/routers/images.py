@@ -18,13 +18,17 @@ router = APIRouter(
     prefix="/images",
     tags=["images"],
     responses={
+        status.HTTP_401_UNAUTHORIZED: {
+            "model": ErrorResponse,
+            "description": "A valid native access token is required.",
+        },
         status.HTTP_502_BAD_GATEWAY: {
             "model": ErrorResponse,
             "description": "Object storage request failed.",
         },
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": ErrorResponse,
-            "description": "Object storage is not configured.",
+            "description": "Authentication or object storage is unavailable.",
         },
     },
 )
@@ -75,7 +79,7 @@ def create_image(
     object is at most 1 MiB. Each account can store 10 images.
     """
     images = require_image_service(request)
-    image = images.create(account.id, file.file, file.size)
+    image = images.create(account, file.file, file.size)
     response.headers["Location"] = f"/images/{image.id}"
     return image
 
@@ -83,7 +87,20 @@ def create_image(
 @router.get("", response_model=ImageListResponse)
 def list_images(account: AccountDep, request: Request) -> ImageListResponse:
     """List images stored for the account, oldest first."""
-    return require_image_service(request).list_images(account.id)
+    return require_image_service(request).list_images(account)
+
+
+@router.put("/{image_id}/portrait", response_model=ImageResponse)
+def import_portrait(
+    image_id: UUID,
+    account: AccountDep,
+    request: Request,
+    file: Annotated[UploadFile, File(description="Profile picture, at most 10 MiB.")],
+) -> ImageResponse:
+    """Import an immutable, bounded WebP portrait; retry with the same ID safely."""
+    return require_image_service(request).create(
+        account, file.file, file.size, image_id=image_id, portrait=True
+    )
 
 
 @router.get(
@@ -98,7 +115,7 @@ def list_images(account: AccountDep, request: Request) -> ImageListResponse:
 )
 def read_image(image_id: UUID, account: AccountDep, request: Request) -> ImageResponse:
     """Return one stored image and a URL that fetches its bytes."""
-    return require_image_service(request).get_image(account.id, image_id)
+    return require_image_service(request).get_image(account, image_id)
 
 
 @router.delete(
@@ -114,7 +131,7 @@ def read_image(image_id: UUID, account: AccountDep, request: Request) -> ImageRe
 )
 def delete_image(image_id: UUID, account: AccountDep, request: Request) -> Response:
     """Delete one stored image belonging to the account."""
-    require_image_service(request).delete_image(account.id, image_id)
+    require_image_service(request).delete_image(account, image_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

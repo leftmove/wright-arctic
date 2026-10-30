@@ -13,6 +13,7 @@ import math
 import warnings
 from dataclasses import dataclass
 from io import BytesIO
+from typing import Literal
 
 from PIL import Image, ImageFile, ImageOps, PngImagePlugin, UnidentifiedImageError
 
@@ -60,6 +61,8 @@ class ImagePipeline:
     lossless_webp_effort: int = 80
     lossless_webp_method: int = 6
     graphic_lossless_max_bytes: int = 256 * 1024
+    max_output_edge: int | None = None
+    output_format: Literal["auto", "webp"] = "auto"
 
 
 def process_image(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
@@ -105,6 +108,12 @@ def _process(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
                     working.close()
                     working = normalized
                 working.info.clear()
+                if pipeline.max_output_edge is not None:
+                    working.thumbnail(
+                        (pipeline.max_output_edge, pipeline.max_output_edge),
+                        Image.Resampling.LANCZOS,
+                        reducing_gap=2.0,
+                    )
                 data, media_type, extension, width, height = _encode_within_budget(
                     working, source_format, pipeline
                 )
@@ -190,6 +199,8 @@ def _encode_within_budget(
             return data, media_type, extension, image.width, image.height
         measured = len(data)
     fitted, width, height = _shrink_to_budget(image, measured, pipeline)
+    if pipeline.output_format == "webp":
+        return fitted, "image/webp", "webp", width, height
     return fitted, "image/avif", "avif", width, height
 
 
@@ -266,7 +277,12 @@ def _encode_edge(
         if resized.width < 1 or resized.height < 1:
             return None
         resized.info.clear()
-        return _encode_avif(resized, pipeline), resized.width, resized.height
+        data = (
+            _encode_portrait_webp(resized)
+            if pipeline.output_format == "webp"
+            else _encode_avif(resized, pipeline)
+        )
+        return data, resized.width, resized.height
     except OSError, ValueError:
         return None
     finally:
@@ -278,6 +294,8 @@ def _encode(
     source_format: str,
     pipeline: ImagePipeline,
 ) -> tuple[bytes, ImageMediaType, ImageExtension]:
+    if pipeline.output_format == "webp":
+        return _encode_portrait_webp(image), "image/webp", "webp"
     if _prefer_lossless(image, source_format):
         lossless = _encode_lossless_webp(image, pipeline)
         if len(lossless) <= min(
@@ -297,6 +315,12 @@ def _prefer_lossless(image: Image.Image, source_format: str) -> bool:
     if image.mode == "RGBA":
         return True
     return source_format in {"PNG", "GIF"}
+
+
+def _encode_portrait_webp(image: Image.Image) -> bytes:
+    buffer = BytesIO()
+    image.save(buffer, format="WEBP", quality=85, method=6)
+    return _nonempty(buffer.getvalue())
 
 
 def _encode_lossless_webp(image: Image.Image, pipeline: ImagePipeline) -> bytes:

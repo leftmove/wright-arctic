@@ -7,9 +7,11 @@ from uuid import UUID, uuid4
 
 from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
 
+from app.accounts import Account
 from app.schemas import ImageListResponse, ImageResponse, ImageSummary
 from app.services.images.errors import (
     ImageEmpty,
+    ImageNotFound,
     ImageQuotaExceeded,
     ImageServiceError,
     ImageTooLarge,
@@ -41,44 +43,62 @@ class ImageService:
         self._store.close()
 
     def create(
-        self, account_id: UUID, source: BinaryIO, known_size: int | None
+        self,
+        account: Account,
+        source: BinaryIO,
+        known_size: int | None,
+        *,
+        image_id: UUID | None = None,
+        portrait: bool = False,
     ) -> ImageResponse:
         """Recompress an upload and store it under the account."""
+        # Caller-selected IDs make migration retries idempotent. IDs remain
+        # scoped to the verified account and existing objects are immutable.
+        if image_id is not None:
+            try:
+                return self.get_image(account, image_id)
+            except ImageNotFound:
+                pass
         payload = _read_limited(source, known_size, self._pipeline.max_upload_bytes)
         limit = TEMPORARY_ACCOUNT_IMAGE_CAP
-        if self._store.count_images(account_id, maximum=limit + 1) >= limit:
+        if self._store.count_images(account, maximum=limit + 1) >= limit:
             raise ImageQuotaExceeded(limit)
-        processed = process_image(payload, self._pipeline)
-        image_id = uuid4()
-        self._store.put_image(account_id, image_id, processed)
-        self._enforce_cap(account_id, image_id, processed.extension, limit)
+        pipeline = (
+            ImagePipeline(max_output_edge=512, output_format="webp")
+            if portrait
+            else self._pipeline
+        )
+        processed = process_image(payload, pipeline)
+        immutable = image_id is not None
+        image_id = image_id or uuid4()
+        if not self._store.put_image(account, image_id, processed, if_absent=immutable):
+            return self.get_image(account, image_id)
+        self._enforce_cap(account, image_id, processed.extension, limit)
         return ImageResponse(
             id=image_id,
             media_type=processed.media_type,
             byte_size=len(processed.data),
             width=processed.width,
             height=processed.height,
-            url=_http_url(
-                self._store.url_for(account_id, image_id, processed.extension)
-            ),
+            url=_http_url(self._store.url_for(account, image_id, processed.extension)),
             url_expires_in=self._store.url_expires_in,
             created_at=datetime.now(UTC),
         )
 
-    def list_images(self, account_id: UUID) -> ImageListResponse:
+    def list_images(self, account: Account) -> ImageListResponse:
         """List the account's stored images, oldest first."""
         images = [
-            _summary(account_id, image, self._store)
-            for image in self._store.list_images(account_id, limit=MAX_LISTED_IMAGES)
+            _summary(account, image, self._store)
+            for image in self._store.list_images(account, limit=MAX_LISTED_IMAGES)
         ]
         return ImageListResponse(images=images)
 
-    def get_image(self, account_id: UUID, image_id: UUID) -> ImageResponse:
+    def get_image(self, account: Account, image_id: UUID) -> ImageResponse:
         """Return one stored image, including its pixel dimensions."""
-        image = self._store.get_image(account_id, image_id)
+        image = self._store.get_image(account, image_id)
         if image.width is None or image.height is None:
             raise StorageInvalid()
-        summary = _summary(account_id, image, self._store)
+        summary = _summary(account, image, self._store)
         return ImageResponse(
             id=summary.id,
             media_type=summary.media_type,
@@ -90,25 +110,25 @@ class ImageService:
             created_at=summary.created_at,
         )
 
-    def delete_image(self, account_id: UUID, image_id: UUID) -> None:
+    def delete_image(self, account: Account, image_id: UUID) -> None:
         """Delete one stored image belonging to the account."""
-        self._store.delete_image(account_id, image_id)
+        self._store.delete_image(account, image_id)
 
     def _enforce_cap(
         self,
-        account_id: UUID,
+        account: Account,
         image_id: UUID,
         extension: ImageExtension,
         limit: int,
     ) -> None:
-        stored = self._store.list_images(account_id, limit=MAX_LISTED_IMAGES)
+        stored = self._store.list_images(account, limit=MAX_LISTED_IMAGES)
         if len(stored) <= limit:
             return
         keep = {image.id for image in stored[:limit]}
         if image_id in keep:
             return
         try:
-            self._store.discard_image(account_id, image_id, extension)
+            self._store.discard_image(account, image_id, extension)
         except ImageServiceError:
             logger.warning("failed to remove an image stored above the account cap")
             raise
@@ -135,12 +155,12 @@ def _read_limited(source: BinaryIO, known_size: int | None, limit: int) -> bytes
     return payload
 
 
-def _summary(account_id: UUID, image: ImageObject, store: S3ImageStore) -> ImageSummary:
+def _summary(account: Account, image: ImageObject, store: S3ImageStore) -> ImageSummary:
     return ImageSummary(
         id=image.id,
         media_type=image.media_type,
         byte_size=image.byte_size,
-        url=_http_url(store.url_for(account_id, image.id, image.extension)),
+        url=_http_url(store.url_for(account, image.id, image.extension)),
         url_expires_in=store.url_expires_in,
         created_at=image.created_at,
     )
