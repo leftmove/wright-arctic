@@ -30,6 +30,15 @@ def png(*, alpha: bool = False, profile: bytes | None = None) -> bytes:
 
 
 class ImageFormatTests(unittest.TestCase):
+    def test_indexed_png_profile_is_applied_after_expanding_palette(self) -> None:
+        profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        stream = BytesIO()
+        with Image.open(BytesIO(png())) as image, image.quantize() as indexed:
+            indexed.save(stream, format="PNG", icc_profile=profile)
+        encoded = process_image(stream.getvalue(), ImagePipeline())
+        pixels = imagecodecs.jpegxl_decode(encoded.data)
+        np.testing.assert_array_equal(pixels[0, 0], [240, 10, 20])
+
     def test_lossless_graphics_preserve_rgb_alpha_and_strip_metadata(self) -> None:
         profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
         for alpha in (False, True):

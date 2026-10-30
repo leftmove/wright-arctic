@@ -163,6 +163,13 @@ def _process(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
                     working = opened.copy()
                 profile = working.info.get("icc_profile")
                 if isinstance(profile, bytes):
+                    # ICC transforms operate on color samples, not palette
+                    # indexes. Expand indexed PNG/GIF pixels (including alpha)
+                    # before applying their RGB profile.
+                    if working.mode == "P":
+                        expanded = _display_image(working)
+                        working.close()
+                        working = expanded
                     converted = ImageCms.profileToProfile(
                         working,
                         ImageCms.ImageCmsProfile(BytesIO(profile)),
