@@ -146,6 +146,8 @@ jobs:
           "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" pull --yes --environment=production
 
       - name: Build the FastAPI function
+        env:
+          VERCEL_PYTHON_DISABLE_RUNTIME_INSTALL: "1"
         run: |
           "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" build --prod
 
