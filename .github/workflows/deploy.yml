@@ -186,16 +186,17 @@ jobs:
             throw new Error('Refusing to promote a deployment outside this production project');
           }
           api(`/v10/projects/${project}/promote/${deployment.id}`, 'POST');
-          for (let attempt = 0; attempt < 20; attempt++) {
-            const state = JSON.parse(api(`/v9/projects/${project}`)).lastAliasRequest;
-            if (state?.toDeploymentId === deployment.id) {
-              if (state.jobStatus === 'succeeded') {
-                console.log('Production promotion verified.');
-                process.exit(0);
-              }
-              if (state.jobStatus === 'failed') throw new Error('Production promotion failed');
+          // Project state reports the actual production target even when
+          // Vercel does not expose a lastAliasRequest for the promotion.
+          const deadline = Date.now() + 180_000;
+          let productionId;
+          while (Date.now() < deadline) {
+            productionId = JSON.parse(api(`/v9/projects/${project}`)).targets?.production?.id;
+            if (productionId === deployment.id) {
+              console.log('Production promotion verified.');
+              process.exit(0);
             }
             await new Promise(resolve => setTimeout(resolve, 3000));
           }
-          throw new Error('Production promotion timed out');
+          throw new Error(`Production promotion timed out: expected ${deployment.id}, observed ${productionId ?? 'no production target'}`);
           JS
