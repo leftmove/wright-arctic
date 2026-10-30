@@ -158,7 +158,9 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             {"iat": False},
             {"nbf": now + 60},
             {"nbf": "0"},
-            {"exp": now + 3600},
+            # Pin both endpoints: minting the token across a second boundary
+            # must not turn this overlong lifetime into an exactly valid one.
+            {"exp": now + 3600, "iat": now - 1},
             {"exp": now - 1, "iat": now},
         ]
         for claims in cases:
