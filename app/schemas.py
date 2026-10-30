@@ -35,7 +35,7 @@ class ErrorResponse(ResponseModel):
 
 class ImageSummary(ResponseModel):
     id: UUID
-    media_type: Literal["image/avif", "image/webp"]
+    media_type: Literal["image/jxl", "image/avif", "image/webp"]
     byte_size: int = Field(ge=1)
     url: AnyHttpUrl
     url_expires_in: int | None = Field(

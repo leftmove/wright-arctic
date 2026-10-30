@@ -5,8 +5,9 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-type ImageMediaType = Literal["image/avif", "image/webp"]
-type ImageExtension = Literal["avif", "webp"]
+type ImageMediaType = Literal["image/jxl", "image/avif", "image/webp"]
+type ImageExtension = Literal["jxl", "avif", "webp"]
+type DeliveryFormat = Literal["jxl", "avif", "webp"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +19,7 @@ class ProcessedImage:
     height: int
     media_type: ImageMediaType
     extension: ImageExtension
+    channels: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,3 +33,5 @@ class ImageObject:
     created_at: datetime
     width: int | None = None
     height: int | None = None
+    variant: bool = False
+    channels: int | None = None

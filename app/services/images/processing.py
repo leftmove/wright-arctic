@@ -1,21 +1,21 @@
-"""Recompress uploaded images into a bounded, metadata-free derivative.
-
-JPEG, PNG, WebP, GIF, and AVIF are accepted. Animations are rejected.
-Photographs become AVIF. PNG, GIF, and images with transparency become
-lossless WebP when that stays within the stored-byte budget, and AVIF
-otherwise. When the preferred encoding is still too large, the long edge is
-reduced until the stored object fits. Original bytes, EXIF, XMP, and ICC
-profiles are never stored.
-"""
+"""Normalize still uploads to sRGB JPEG XL; derive web variants from that source."""
 
 import logging
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
-from typing import Literal
 
-from PIL import Image, ImageFile, ImageOps, PngImagePlugin, UnidentifiedImageError
+import imagecodecs
+import numpy as np
+from PIL import (
+    Image,
+    ImageCms,
+    ImageFile,
+    ImageOps,
+    PngImagePlugin,
+    UnidentifiedImageError,
+)
 
 from app.services.images.errors import (
     ImageAnimated,
@@ -32,7 +32,13 @@ from app.services.images.limits import (
     MAX_STORED_BYTES,
     MAX_UPLOAD_BYTES,
 )
-from app.services.images.models import ImageExtension, ImageMediaType, ProcessedImage
+from app.services.images.models import (
+    DeliveryFormat,
+    ImageExtension,
+    ImageMediaType,
+    ImageObject,
+    ProcessedImage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,14 +61,14 @@ class ImagePipeline:
     max_stored_bytes: int = MAX_STORED_BYTES
     max_decode_edge: int = MAX_DECODE_EDGE
     max_decode_pixels: int = MAX_DECODE_PIXELS
-    avif_quality: int = 60
-    avif_speed: int = 8
+    avif_quality: int = 80
+    avif_speed: int = 6
     avif_threads: int = 1
-    lossless_webp_effort: int = 80
-    lossless_webp_method: int = 6
-    graphic_lossless_max_bytes: int = 256 * 1024
+    jxl_distance: float = 1.0
+    jxl_effort: int = 5
+    lossless: bool = False
     max_output_edge: int | None = None
-    output_format: Literal["auto", "webp"] = "auto"
+    output_format: DeliveryFormat = "jxl"
 
 
 def process_image(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
@@ -80,7 +86,59 @@ def process_image(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
         raise ImageDimensions() from None
     except UnidentifiedImageError:
         raise ImageUnsupported() from None
-    except OSError, SyntaxError, ValueError, EOFError:
+    except (
+        OSError,
+        SyntaxError,
+        ValueError,
+        EOFError,
+        RuntimeError,
+        ImageCms.PyCMSError,
+    ):
+        raise ImageInvalid() from None
+
+
+def delivery_variant(
+    payload: bytes, source: ImageObject, format: DeliveryFormat
+) -> ProcessedImage:
+    """Decode only Arctic-generated, bounded sRGB JPEG XL, never arbitrary uploads.
+
+    The reference decoder writes into a bounded caller-owned buffer. Canonical
+    dimensions must agree with storage metadata before a derivative is stored.
+    JPEG XL uploads are intentionally excluded until a header/animation/color
+    aware upload decoder is available; the encoder is not an input validator.
+    """
+    pipeline = ImagePipeline(output_format=format)
+    width, height = source.width, source.height
+    if (
+        source.extension != "jxl"
+        or width is None
+        or height is None
+        or source.channels not in (3, 4)
+    ):
+        raise ImageInvalid()
+    _reject_loaded_dimensions(width, height, pipeline)
+    if len(payload) > MAX_STORED_BYTES:
+        raise ImageTooLarge()
+    try:
+        pixels = imagecodecs.jpegxl_decode(
+            payload,
+            index=0,
+            numthreads=1,
+            out=np.empty((height, width, source.channels), dtype=np.uint8),
+        )
+        if pixels.dtype != np.uint8 or pixels.shape not in (
+            (height, width, 3),
+            (height, width, 4),
+        ):
+            raise ImageInvalid()
+        with Image.fromarray(pixels) as image:
+            data, media_type, extension, width, height = _encode_within_budget(
+                image, "JXL", pipeline
+            )
+        return ProcessedImage(
+            data, width, height, media_type, extension, pixels.shape[2]
+        )
+    except OSError, ValueError, RuntimeError:
         raise ImageInvalid() from None
 
 
@@ -103,6 +161,19 @@ def _process(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
             try:
                 if working is opened:
                     working = opened.copy()
+                profile = working.info.get("icc_profile")
+                if isinstance(profile, bytes):
+                    converted = ImageCms.profileToProfile(
+                        working,
+                        ImageCms.ImageCmsProfile(BytesIO(profile)),
+                        ImageCms.createProfile("sRGB"),
+                        outputMode="RGBA" if working.has_transparency_data else "RGB",
+                    )
+                    if converted is None:
+                        raise ImageInvalid()
+                    if working is not opened:
+                        working.close()
+                    working = converted
                 normalized = _display_image(working)
                 if normalized is not working:
                     working.close()
@@ -123,6 +194,7 @@ def _process(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
                     height=height,
                     media_type=media_type,
                     extension=extension,
+                    channels=4 if working.mode == "RGBA" else 3,
                 )
             finally:
                 if working is not opened:
@@ -190,6 +262,8 @@ def _encode_within_budget(
     source_format: str,
     pipeline: ImagePipeline,
 ) -> tuple[bytes, ImageMediaType, ImageExtension, int, int]:
+    if pipeline.output_format == "jxl" and source_format in {"PNG", "GIF"}:
+        pipeline = replace(pipeline, lossless=True)
     try:
         data, media_type, extension = _encode(image, source_format, pipeline)
     except OSError, ValueError:
@@ -199,9 +273,8 @@ def _encode_within_budget(
             return data, media_type, extension, image.width, image.height
         measured = len(data)
     fitted, width, height = _shrink_to_budget(image, measured, pipeline)
-    if pipeline.output_format == "webp":
-        return fitted, "image/webp", "webp", width, height
-    return fitted, "image/avif", "avif", width, height
+    media_type, extension = _format(pipeline.output_format)
+    return fitted, media_type, extension, width, height
 
 
 def _shrink_to_budget(
@@ -277,11 +350,7 @@ def _encode_edge(
         if resized.width < 1 or resized.height < 1:
             return None
         resized.info.clear()
-        data = (
-            _encode_portrait_webp(resized)
-            if pipeline.output_format == "webp"
-            else _encode_avif(resized, pipeline)
-        )
+        data, _, _ = _encode(resized, "", pipeline)
         return data, resized.width, resized.height
     except OSError, ValueError:
         return None
@@ -296,43 +365,32 @@ def _encode(
 ) -> tuple[bytes, ImageMediaType, ImageExtension]:
     if pipeline.output_format == "webp":
         return _encode_portrait_webp(image), "image/webp", "webp"
-    if _prefer_lossless(image, source_format):
-        lossless = _encode_lossless_webp(image, pipeline)
-        if len(lossless) <= min(
-            pipeline.graphic_lossless_max_bytes, pipeline.max_stored_bytes
-        ):
-            return lossless, "image/webp", "webp"
-        avif = _encode_avif(image, pipeline)
-        if len(lossless) <= len(avif) and len(lossless) <= pipeline.max_stored_bytes:
-            return lossless, "image/webp", "webp"
-        if len(avif) <= pipeline.max_stored_bytes or len(avif) <= len(lossless):
-            return avif, "image/avif", "avif"
-        return lossless, "image/webp", "webp"
-    return _encode_avif(image, pipeline), "image/avif", "avif"
+    if pipeline.output_format == "avif":
+        return _encode_avif(image, pipeline), "image/avif", "avif"
+    lossless = (
+        pipeline.lossless or image.mode == "RGBA" or source_format in {"PNG", "GIF"}
+    )
+    data = imagecodecs.jpegxl_encode(
+        np.asarray(image),
+        lossless=lossless,
+        distance=pipeline.jxl_distance,
+        effort=pipeline.jxl_effort,
+        numthreads=1,
+    )
+    return _nonempty(bytes(data)), "image/jxl", "jxl"
 
 
-def _prefer_lossless(image: Image.Image, source_format: str) -> bool:
-    if image.mode == "RGBA":
-        return True
-    return source_format in {"PNG", "GIF"}
+def _format(format: DeliveryFormat) -> tuple[ImageMediaType, ImageExtension]:
+    if format == "webp":
+        return "image/webp", "webp"
+    if format == "avif":
+        return "image/avif", "avif"
+    return "image/jxl", "jxl"
 
 
 def _encode_portrait_webp(image: Image.Image) -> bytes:
     buffer = BytesIO()
     image.save(buffer, format="WEBP", quality=85, method=6)
-    return _nonempty(buffer.getvalue())
-
-
-def _encode_lossless_webp(image: Image.Image, pipeline: ImagePipeline) -> bytes:
-    buffer = BytesIO()
-    image.save(
-        buffer,
-        format="WEBP",
-        lossless=True,
-        quality=pipeline.lossless_webp_effort,
-        method=pipeline.lossless_webp_method,
-        exact=False,
-    )
     return _nonempty(buffer.getvalue())
 
 

@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import httpx
+import imagecodecs
 import jwt
 from botocore.exceptions import ClientError
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
@@ -34,6 +35,7 @@ from app.services.images.limits import MAX_UPLOAD_BODY_BYTES
 from app.services.images.service import ImageService
 from app.services.images.storage import S3ImageStore, account_prefix, object_key
 from app.settings import Settings
+from app.tests.image_storage import memory_storage
 
 _ISSUER = "https://issuer.example"
 _JWKS = _ISSUER + "/.well-known/jwks.json"
@@ -486,7 +488,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(images.create.call_args.args[0], account)
             response = await client.get("/images/" + str(image_id), headers=headers)
             self.assertEqual(response.status_code, 200)
-            images.get_image.assert_called_once_with(account, image_id)
+            images.get_image.assert_called_once_with(account, image_id, format="webp")
             response = await client.delete("/images/" + str(image_id), headers=headers)
             self.assertEqual(response.status_code, 204)
             images.delete_image.assert_called_once_with(account, image_id)
@@ -515,22 +517,13 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIn(
                 storage_client.put_object.call_args.kwargs["ContentType"],
-                ("image/avif", "image/webp"),
+                ("image/jxl",),
             )
 
     async def test_portrait_import_is_webp_bounded_and_idempotent(self) -> None:
-        storage_client = Mock()
-        storage_client.list_objects_v2.return_value = {"Contents": []}
-        storage_client.generate_presigned_url.return_value = (
-            "https://images.example/signed"
-        )
+        storage_client = memory_storage()
         images = ImageService(S3ImageStore(storage_client, "images", None, 900))
         image_id = uuid4()
-        missing = ClientError(
-            {"Error": {"Code": "404"}},
-            "HeadObject",
-        )
-        storage_client.head_object.side_effect = missing
         source = BytesIO()
         Image.new("RGB", (1200, 800), "red").save(source, format="JPEG")
         async with self.application(images) as (client, _):
@@ -546,20 +539,11 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["id"], str(image_id))
             self.assertEqual(payload["media_type"], "image/webp")
             self.assertLessEqual(max(payload["width"], payload["height"]), 512)
-            stored = storage_client.put_object.call_args.kwargs
+            stored = storage_client.put_object.call_args_list[0].kwargs
             self.assertEqual(stored["IfNoneMatch"], "*")
-            with Image.open(BytesIO(stored["Body"])) as image:
-                self.assertEqual(image.format, "WEBP")
-                self.assertEqual(image.size, (payload["width"], payload["height"]))
-            storage_client.head_object.side_effect = [
-                missing,
-                {
-                    "ContentType": "image/webp",
-                    "ContentLength": len(stored["Body"]),
-                    "LastModified": datetime.now(UTC),
-                    "Metadata": stored["Metadata"],
-                },
-            ]
+            self.assertEqual(stored["ContentType"], "image/jxl")
+            pixels = imagecodecs.jpegxl_decode(stored["Body"])
+            self.assertEqual(pixels.shape[:2], (payload["height"], payload["width"]))
             second = await client.put(
                 path,
                 headers=headers,
@@ -567,7 +551,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(second.status_code, 200, second.text)
             self.assertEqual(second.json()["id"], payload["id"])
-            storage_client.put_object.assert_called_once()
+            self.assertEqual(storage_client.put_object.call_count, 2)
 
     async def test_portrait_upload_budget_is_enforced_before_parsing(self) -> None:
         async with self.application(Mock(spec=ImageService)) as (client, _):

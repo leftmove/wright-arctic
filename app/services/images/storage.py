@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypeVar
 from urllib.parse import quote
@@ -57,12 +58,14 @@ _OBJECT_KEY = re.compile(
     r"(?P<account>[0-9a-f]{64})"
     r"/images/"
     r"(?P<image>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-    r"\.(?P<ext>avif|webp)$"
+    r"\.(?P<ext>jxl|avif|webp)$"
 )
 _MEDIA_TYPES: dict[ImageExtension, ImageMediaType] = {
+    "jxl": "image/jxl",
     "avif": "image/avif",
     "webp": "image/webp",
 }
+_EXTENSIONS: tuple[ImageExtension, ...] = ("jxl", "avif", "webp")
 _MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 _T = TypeVar("_T")
 
@@ -100,11 +103,13 @@ class S3ImageStore:
         image: ProcessedImage,
         *,
         if_absent: bool = False,
+        variant: bool = False,
+        created_at: datetime | None = None,
     ) -> bool:
         """Write one recompressed image."""
         if len(image.data) > MAX_STORED_BYTES:
             raise StoredImageTooLarge()
-        key = object_key(account, image_id, image.extension)
+        key = object_key(account, image_id, image.extension, variant=variant)
         cache_control = (
             "public, max-age=31536000, immutable"
             if self._public_base_url is not None
@@ -112,6 +117,13 @@ class S3ImageStore:
         )
 
         def _put() -> bool:
+            metadata = {
+                "width": str(image.width),
+                "height": str(image.height),
+                "channels": str(image.channels),
+            }
+            if created_at is not None:
+                metadata["created_at"] = created_at.isoformat()
             request: PutObjectRequestTypeDef = {
                 "Bucket": self._bucket,
                 "Key": key,
@@ -119,7 +131,7 @@ class S3ImageStore:
                 "ContentType": image.media_type,
                 "CacheControl": cache_control,
                 "ContentDisposition": "inline",
-                "Metadata": {"width": str(image.width), "height": str(image.height)},
+                "Metadata": metadata,
             }
             if if_absent:
                 request["IfNoneMatch"] = "*"
@@ -146,23 +158,59 @@ class S3ImageStore:
 
     def delete_image(self, account: Account, image_id: UUID) -> None:
         """Delete one stored image, or raise when it is not in the account."""
-        stored = self.get_image(account, image_id)
-        self.discard_image(account, image_id, stored.extension)
+        self.get_image(account, image_id)
+        for extension in ("avif", "webp"):
+            key = object_key(account, image_id, extension, variant=True)
+
+            def _delete_variant(object_key: str = key) -> None:
+                self._client.delete_object(Bucket=self._bucket, Key=object_key)
+
+            self._invoke(_delete_variant)
+        for extension in _EXTENSIONS:
+            self.discard_image(account, image_id, extension)
 
     def get_image(self, account: Account, image_id: UUID) -> ImageObject:
         """Read metadata for one stored image."""
-        for extension in ("avif", "webp"):
-            key = object_key(account, image_id, extension)
-
-            def _head(object_key: str = key) -> HeadObjectOutputTypeDef:
-                return self._client.head_object(Bucket=self._bucket, Key=object_key)
-
+        for extension in _EXTENSIONS:
             try:
-                response = self._invoke(_head, missing_ok=True)
+                return self.get_representation(account, image_id, extension)
             except ImageNotFound:
                 continue
-            return _object_from_head(image_id, extension, response)
         raise ImageNotFound()
+
+    def get_representation(
+        self,
+        account: Account,
+        image_id: UUID,
+        extension: ImageExtension,
+        *,
+        variant: bool = False,
+    ) -> ImageObject:
+        """Read one exact canonical, legacy, or versioned delivery object."""
+        key = object_key(account, image_id, extension, variant=variant)
+        response = self._invoke(
+            lambda: self._client.head_object(Bucket=self._bucket, Key=key),
+            missing_ok=True,
+        )
+        return replace(
+            _object_from_head(image_id, extension, response), variant=variant
+        )
+
+    def read_image(self, account: Account, image: ImageObject) -> bytes:
+        """Read a bounded source object without fetching a capability URL."""
+        if image.byte_size > MAX_STORED_BYTES:
+            raise StorageInvalid()
+        key = object_key(account, image.id, image.extension, variant=image.variant)
+
+        def _read() -> bytes:
+            response = self._client.get_object(Bucket=self._bucket, Key=key)
+            with response["Body"] as body:
+                payload = body.read(MAX_STORED_BYTES + 1)
+            if len(payload) != image.byte_size or len(payload) > MAX_STORED_BYTES:
+                raise StorageInvalid()
+            return payload
+
+        return self._invoke(_read, missing_ok=True)
 
     def list_images(self, account: Account, *, limit: int) -> list[ImageObject]:
         """Return up to `limit` images for an account, oldest first.
@@ -172,20 +220,30 @@ class S3ImageStore:
         """
         if limit < 1:
             return []
-        found = list(self._iter_images(account))
-        found.sort(key=_listing_order)
-        return found[:limit]
+        found: dict[UUID, ImageObject] = {}
+        for image in self._iter_images(account):
+            previous = found.get(image.id)
+            if previous is None:
+                found[image.id] = image
+            else:
+                canonical = image if image.extension == "jxl" else previous
+                found[image.id] = replace(
+                    canonical, created_at=min(previous.created_at, image.created_at)
+                )
+        ordered = list(found.values())
+        ordered.sort(key=_listing_order)
+        return ordered[:limit]
 
     def count_images(self, account: Account, *, maximum: int) -> int:
         """Count stored images, stopping once `maximum` is reached."""
         if maximum < 1:
             return 0
-        counted = 0
+        counted: set[UUID] = set()
         for _image in self._iter_images(account):
-            counted += 1
-            if counted >= maximum:
+            counted.add(_image.id)
+            if len(counted) >= maximum:
                 break
-        return counted
+        return len(counted)
 
     def _iter_images(self, account: Account) -> Iterator[ImageObject]:
         token: str | None = None
@@ -210,10 +268,15 @@ class S3ImageStore:
             token = next_token
 
     def url_for(
-        self, account: Account, image_id: UUID, extension: ImageExtension
+        self,
+        account: Account,
+        image_id: UUID,
+        extension: ImageExtension,
+        *,
+        variant: bool = False,
     ) -> str:
         """Return the URL a client uses to fetch the object."""
-        key = object_key(account, image_id, extension)
+        key = object_key(account, image_id, extension, variant=variant)
         if self._public_base_url is not None:
             return f"{self._public_base_url}/{quote(key, safe='/')}"
 
@@ -306,9 +369,18 @@ def build_image_store(settings: Settings) -> S3ImageStore | None:
     )
 
 
-def object_key(account: Account, image_id: UUID, extension: ImageExtension) -> str:
+def object_key(
+    account: Account,
+    image_id: UUID,
+    extension: ImageExtension,
+    *,
+    variant: bool = False,
+) -> str:
     """Return the bucket key for one image."""
-    return f"{account_prefix(account)}{image_id}.{extension}"
+    suffix = (
+        f"{image_id}/variants/v1.{extension}" if variant else f"{image_id}.{extension}"
+    )
+    return f"{account_prefix(account)}{suffix}"
 
 
 def account_prefix(account: Account) -> str:
@@ -338,14 +410,21 @@ def _object_from_head(
         raise StorageInvalid() from None
     if byte_size < 1:
         raise StorageInvalid()
+    created_at = _aware(modified)
+    if "created_at" in metadata:
+        try:
+            created_at = _aware(datetime.fromisoformat(metadata["created_at"]))
+        except ValueError:
+            raise StorageInvalid() from None
     return ImageObject(
         id=image_id,
         media_type=_MEDIA_TYPES[extension],
         extension=extension,
         byte_size=byte_size,
-        created_at=_aware(modified),
+        created_at=created_at,
         width=_dimension(metadata, "width"),
         height=_dimension(metadata, "height"),
+        channels=_dimension(metadata, "channels") if extension == "jxl" else None,
     )
 
 
@@ -380,6 +459,8 @@ def _parse_object_key(key: str, account: Account) -> tuple[UUID, ImageExtension]
     if owner != account.storage_key:
         return None
     extension = match.group("ext")
+    if extension == "jxl":
+        return image_id, "jxl"
     if extension == "avif":
         return image_id, "avif"
     if extension == "webp":

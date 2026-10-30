@@ -10,6 +10,7 @@ from app.dependencies import AccountDep, require_image_service
 from app.schemas import ErrorResponse, ImageListResponse, ImageResponse, error_body
 from app.services.images.errors import ImageServiceError
 from app.services.images.limits import MAX_STORED_BYTES, MAX_UPLOAD_BYTES
+from app.services.images.models import DeliveryFormat
 
 _UPLOAD_MIB = MAX_UPLOAD_BYTES // (1024 * 1024)
 _STORED_MIB = MAX_STORED_BYTES // (1024 * 1024)
@@ -75,7 +76,7 @@ def create_image(
     """Store a general-purpose image.
 
     The upload is limited to 10 MiB. JPEG, PNG, WebP, AVIF, and static GIF are
-    stripped of metadata and recompressed to AVIF or lossless WebP. The stored
+    normalized to sRGB, stripped of metadata and recompressed to JPEG XL. The stored
     object is at most 1 MiB. Each account can store 10 images.
     """
     images = require_image_service(request)
@@ -96,10 +97,11 @@ def import_portrait(
     account: AccountDep,
     request: Request,
     file: Annotated[UploadFile, File(description="Profile picture, at most 10 MiB.")],
+    format: DeliveryFormat = "webp",
 ) -> ImageResponse:
-    """Import an immutable, bounded WebP portrait; retry with the same ID safely."""
+    """Import an immutable JPEG XL portrait and select a delivery format."""
     return require_image_service(request).create(
-        account, file.file, file.size, image_id=image_id, portrait=True
+        account, file.file, file.size, image_id=image_id, portrait=True, format=format
     )
 
 
@@ -113,9 +115,14 @@ def import_portrait(
         },
     },
 )
-def read_image(image_id: UUID, account: AccountDep, request: Request) -> ImageResponse:
+def read_image(
+    image_id: UUID,
+    account: AccountDep,
+    request: Request,
+    format: DeliveryFormat = "webp",
+) -> ImageResponse:
     """Return one stored image and a URL that fetches its bytes."""
-    return require_image_service(request).get_image(account, image_id)
+    return require_image_service(request).get_image(account, image_id, format=format)
 
 
 @router.delete(
