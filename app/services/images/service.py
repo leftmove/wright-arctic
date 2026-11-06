@@ -11,6 +11,7 @@ from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
 
 from app.accounts import Account
 from app.schemas import ImageListResponse, ImageResponse, ImageSummary
+from app.services.images.content import content_id, source_digest
 from app.services.images.errors import (
     ImageEmpty,
     ImageNotFound,
@@ -78,16 +79,40 @@ class ImageService:
             except ImageNotFound:
                 pass
         payload = _read_limited(source, known_size, self._pipeline.max_upload_bytes)
+        digest = None
+        if image_id is None and not portrait:
+            digest = source_digest(payload)
+            image_id = content_id(account, digest)
+            try:
+                return self.get_by_source(account, digest, format=format or "jxl")
+            except ImageNotFound:
+                pass
+        image_id = image_id or uuid4()
         limit = TEMPORARY_ACCOUNT_IMAGE_CAP
         if self._store.count_images(account, maximum=limit + 1) >= limit:
+            # Another device may have completed the same upload after our first
+            # lookup. Reuse it even when its write filled the account quota.
+            if digest is not None:
+                try:
+                    return self.get_by_source(account, digest, format=format or "jxl")
+                except ImageNotFound:
+                    pass
             raise ImageQuotaExceeded(limit)
         pipeline = (
             replace(self._pipeline, max_output_edge=512) if portrait else self._pipeline
         )
         processed = process_image(payload, pipeline)
-        immutable = image_id is not None
-        image_id = image_id or uuid4()
-        if not self._store.put_image(account, image_id, processed, if_absent=immutable):
+        created_at = datetime.now(UTC)
+        if not self._store.put_image(
+            account,
+            image_id,
+            processed,
+            if_absent=True,
+            source_sha256=digest,
+            created_at=created_at,
+        ):
+            if digest is not None:
+                return self.get_by_source(account, digest, format=format or "jxl")
             return self.get_image(
                 account, image_id, format=format or ("webp" if portrait else "jxl")
             )
@@ -100,7 +125,8 @@ class ImageService:
             byte_size=len(processed.data),
             width=processed.width,
             height=processed.height,
-            created_at=datetime.now(UTC),
+            created_at=created_at,
+            source_sha256=digest,
         )
         delivered = self._delivery(
             account,
@@ -109,6 +135,22 @@ class ImageService:
             processed.data,
         )
         return self._response(account, delivered)
+
+    def get_by_source(
+        self, account: Account, digest: str, *, format: DeliveryFormat = "jxl"
+    ) -> ImageResponse:
+        """Resolve verified source bytes without uploading or recompressing them.
+
+        A client-provided digest can only look up an object. Only create(), which
+        hashes the actual bounded upload, can populate this cache. Deletion of
+        the canonical object also removes its cache entry without a second index.
+        """
+        image = self._store.get_representation(
+            account, content_id(account, digest), "jxl"
+        )
+        if image.source_sha256 != digest:
+            raise StorageInvalid()
+        return self._response(account, self._delivery(account, image, format))
 
     def list_images(self, account: Account) -> ImageListResponse:
         """List the account's stored images, oldest first."""

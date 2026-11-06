@@ -30,6 +30,7 @@ from app.authentication.service import (
 )
 from app.main import create_app
 from app.schemas import ImageListResponse, ImageResponse
+from app.services.images.content import source_digest
 from app.services.images.errors import ImageNotFound
 from app.services.images.limits import MAX_UPLOAD_BODY_BYTES
 from app.services.images.service import ImageService
@@ -496,11 +497,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             images.delete_image.assert_called_once_with(account, image_id)
 
     async def test_real_image_upload_is_stored_in_the_verified_namespace(self) -> None:
-        storage_client = Mock()
-        storage_client.list_objects_v2.return_value = {"Contents": []}
-        storage_client.generate_presigned_url.return_value = (
-            "https://images.example/signed"
-        )
+        storage_client = memory_storage()
         images = ImageService(S3ImageStore(storage_client, "images", None, 900))
         source = BytesIO()
         Image.new("RGB", (2, 2), "red").save(source, format="PNG")
@@ -521,6 +518,35 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 storage_client.put_object.call_args.kwargs["ContentType"],
                 ("image/jxl",),
             )
+            path = "/images/by-source/" + source_digest(source.getvalue())
+            cached = await client.get(
+                path, headers={"Authorization": "Bearer " + token(self.private_key)}
+            )
+            self.assertEqual(cached.status_code, 200, cached.text)
+            self.assertEqual(cached.json()["id"], response.json()["id"])
+            other = await client.get(
+                path,
+                headers={
+                    "Authorization": "Bearer "
+                    + token(self.private_key, claims={"sub": "another-account"})
+                },
+            )
+            self.assertEqual(other.status_code, 404)
+            anonymous = await client.get(path)
+            self.assertEqual(anonymous.status_code, 401)
+            invalid = await client.get(
+                "/images/by-source/not-a-hash",
+                headers={"Authorization": "Bearer " + token(self.private_key)},
+            )
+            self.assertEqual(invalid.status_code, 422)
+            duplicate = await client.post(
+                "/images",
+                headers={"Authorization": "Bearer " + token(self.private_key)},
+                files={"file": ("renamed.png", source.getvalue(), "image/png")},
+            )
+            self.assertEqual(duplicate.status_code, 201, duplicate.text)
+            self.assertEqual(duplicate.json()["id"], response.json()["id"])
+            self.assertEqual(storage_client.put_object.call_count, 1)
 
     async def test_portrait_import_is_webp_bounded_and_idempotent(self) -> None:
         storage_client = memory_storage()

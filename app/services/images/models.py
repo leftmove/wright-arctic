@@ -35,3 +35,4 @@ class ImageObject:
     height: int | None = None
     variant: bool = False
     channels: int | None = None
+    source_sha256: str | None = None

@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 from io import BytesIO
+from threading import Lock
 from unittest.mock import Mock
 
 from botocore.exceptions import ClientError
@@ -11,6 +12,7 @@ def memory_storage() -> Mock:
     objects: dict[str, tuple[bytes, dict[str, str], str]] = {}
     client = Mock()
     modified = datetime.now(UTC)
+    writes = Lock()
 
     def missing() -> ClientError:
         return ClientError({"Error": {"Code": "NoSuchKey"}}, "HeadObject")
@@ -26,20 +28,21 @@ def memory_storage() -> Mock:
         ContentDisposition: str,
         IfNoneMatch: str | None = None,
     ) -> None:
-        if IfNoneMatch == "*" and Key in objects:
-            raise ClientError(
-                {
-                    "ResponseMetadata": {
-                        "HTTPStatusCode": 412,
-                        "HTTPHeaders": {},
-                        "HostId": "test",
-                        "RequestId": "test",
-                        "RetryAttempts": 0,
-                    }
-                },
-                "PutObject",
-            )
-        objects[Key] = (Body, Metadata, ContentType)
+        with writes:
+            if IfNoneMatch == "*" and Key in objects:
+                raise ClientError(
+                    {
+                        "ResponseMetadata": {
+                            "HTTPStatusCode": 412,
+                            "HTTPHeaders": {},
+                            "HostId": "test",
+                            "RequestId": "test",
+                            "RetryAttempts": 0,
+                        }
+                    },
+                    "PutObject",
+                )
+            objects[Key] = (Body, Metadata, ContentType)
 
     def head(*, Bucket: str, Key: str) -> dict[str, object]:
         if Key not in objects:

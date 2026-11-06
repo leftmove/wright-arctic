@@ -3,11 +3,21 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, FastAPI, File, Request, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    File,
+    Path,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse
 
 from app.dependencies import AccountDep, require_image_service
 from app.schemas import ErrorResponse, ImageListResponse, ImageResponse, error_body
+from app.services.images.content import SOURCE_SHA256_PATTERN
 from app.services.images.errors import ImageServiceError
 from app.services.images.limits import MAX_STORED_BYTES, MAX_UPLOAD_BYTES
 from app.services.images.models import DeliveryFormat
@@ -77,7 +87,9 @@ def create_image(
 
     The upload is limited to 10 MiB. JPEG, PNG, WebP, AVIF, and static GIF are
     normalized to sRGB, stripped of metadata and recompressed to JPEG XL. The stored
-    object is at most 1 MiB. Each account can store 10 images.
+    object is at most 1 MiB. Exact source bytes reuse the account's existing image,
+    including when its quota is full. Concurrent duplicates share one immutable
+    object. Each account can store 10 distinct images.
     """
     images = require_image_service(request)
     image = images.create(account, file.file, file.size)
@@ -89,6 +101,30 @@ def create_image(
 def list_images(account: AccountDep, request: Request) -> ImageListResponse:
     """List images stored for the account, oldest first."""
     return require_image_service(request).list_images(account)
+
+
+@router.get(
+    "/by-source/{source_sha256}",
+    response_model=ImageResponse,
+    responses={
+        status.HTTP_404_NOT_FOUND: {
+            "model": ErrorResponse,
+            "description": "These source bytes are not cached for this account.",
+        },
+    },
+)
+def image_by_source(
+    source_sha256: Annotated[str, Path(pattern=SOURCE_SHA256_PATTERN)],
+    account: AccountDep,
+    request: Request,
+) -> ImageResponse:
+    """Reuse an exact image already uploaded by the verified account.
+
+    The digest is the lowercase SHA-256 of the original upload bytes. A miss
+    returns 404; uploading those bytes through POST /images populates the cache.
+    The response contains a fresh delivery URL, never a cached expiring URL.
+    """
+    return require_image_service(request).get_by_source(account, source_sha256)
 
 
 @router.put("/{image_id}/portrait", response_model=ImageResponse)

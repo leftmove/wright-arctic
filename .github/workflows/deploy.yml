@@ -2,10 +2,6 @@ name: Deploy
 
 on:
   workflow_dispatch:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-    branches: [main]
 
 permissions:
   contents: read
@@ -17,13 +13,7 @@ concurrency:
 jobs:
   current:
     name: Keep the latest main commit
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
-      || (
-        github.event_name == 'workflow_run'
-        && github.event.workflow_run.conclusion == 'success'
-        && github.event.workflow_run.head_branch == 'main'
-      )
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     outputs:
       deploy: ${{ steps.gate.outputs.deploy }}
@@ -35,7 +25,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          sha="${{ github.event.workflow_run.head_sha || github.sha }}"
+          sha="${{ github.sha }}"
           latest="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           if [ "$sha" = "$latest" ]; then

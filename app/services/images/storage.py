@@ -22,6 +22,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import SecretStr
 
 from app.accounts import Account
+from app.services.images.content import SOURCE_SHA256_PATTERN
 from app.services.images.errors import (
     ImageNotFound,
     StorageInvalid,
@@ -105,6 +106,7 @@ class S3ImageStore:
         if_absent: bool = False,
         variant: bool = False,
         created_at: datetime | None = None,
+        source_sha256: str | None = None,
     ) -> bool:
         """Write one recompressed image."""
         if len(image.data) > MAX_STORED_BYTES:
@@ -124,6 +126,8 @@ class S3ImageStore:
             }
             if created_at is not None:
                 metadata["created_at"] = created_at.isoformat()
+            if source_sha256 is not None:
+                metadata["source_sha256"] = source_sha256
             request: PutObjectRequestTypeDef = {
                 "Bucket": self._bucket,
                 "Key": key,
@@ -416,6 +420,12 @@ def _object_from_head(
             created_at = _aware(datetime.fromisoformat(metadata["created_at"]))
         except ValueError:
             raise StorageInvalid() from None
+    source_sha256 = metadata.get("source_sha256")
+    if (
+        source_sha256 is not None
+        and re.fullmatch(SOURCE_SHA256_PATTERN, source_sha256) is None
+    ):
+        raise StorageInvalid()
     return ImageObject(
         id=image_id,
         media_type=_MEDIA_TYPES[extension],
@@ -425,6 +435,7 @@ def _object_from_head(
         width=_dimension(metadata, "width"),
         height=_dimension(metadata, "height"),
         channels=_dimension(metadata, "channels") if extension == "jxl" else None,
+        source_sha256=source_sha256,
     )
 
 
