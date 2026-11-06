@@ -330,6 +330,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
         async with self.application() as (client, _):
             for method, path in (
                 ("GET", "/images"),
+                ("GET", "/images/by-source/" + "0" * 64),
                 ("POST", "/images"),
                 ("GET", "/images/" + str(uuid4())),
                 ("DELETE", "/images/" + str(uuid4())),
