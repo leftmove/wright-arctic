@@ -1,5 +1,6 @@
 """Store general-purpose images for an account."""
 
+import hashlib
 import logging
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -78,6 +79,23 @@ class ImageService:
             except ImageNotFound:
                 pass
         payload = _read_limited(source, known_size, self._pipeline.max_upload_bytes)
+        # Fingerprint the bytes ourselves, never a caller-supplied digest.
+        # Reuse precedes quota and encoding, including after a service restart.
+        source_sha256 = (
+            None
+            if portrait or image_id is not None
+            else hashlib.sha256(payload).hexdigest()
+        )
+        if source_sha256 is not None:
+            image_id = _source_id(account, source_sha256)
+            try:
+                existing = self._source_image(account, source_sha256)
+            except ImageNotFound:
+                pass
+            else:
+                return self._response(
+                    account, self._delivery(account, existing, format or "jxl")
+                )
         limit = TEMPORARY_ACCOUNT_IMAGE_CAP
         if self._store.count_images(account, maximum=limit + 1) >= limit:
             raise ImageQuotaExceeded(limit)
@@ -87,7 +105,13 @@ class ImageService:
         processed = process_image(payload, pipeline)
         immutable = image_id is not None
         image_id = image_id or uuid4()
-        if not self._store.put_image(account, image_id, processed, if_absent=immutable):
+        if not self._store.put_image(
+            account,
+            image_id,
+            processed,
+            if_absent=immutable,
+            source_sha256=source_sha256,
+        ):
             return self.get_image(
                 account, image_id, format=format or ("webp" if portrait else "jxl")
             )
@@ -109,6 +133,18 @@ class ImageService:
             processed.data,
         )
         return self._response(account, delivered)
+
+    def get_by_source(self, account: Account, source_sha256: str) -> ImageResponse:
+        """Look up original upload bytes without decoding or generating variants."""
+        return self._response(account, self._source_image(account, source_sha256))
+
+    def _source_image(self, account: Account, source_sha256: str) -> ImageObject:
+        image = self._store.get_representation(
+            account, _source_id(account, source_sha256), "jxl"
+        )
+        if image.source_sha256 != source_sha256:
+            raise StorageInvalid()
+        return image
 
     def list_images(self, account: Account) -> ImageListResponse:
         """List the account's stored images, oldest first."""
@@ -231,6 +267,15 @@ def build_image_service(settings: Settings) -> ImageService | None:
     if store is None:
         return None
     return ImageService(store)
+
+
+def _source_id(account: Account, source_sha256: str) -> UUID:
+    # Namespace both issuer and subject; a different account cannot discover or
+    # overwrite another account's image even when the source bytes are identical.
+    fingerprint = f"image-source-v1:{account.storage_key}:{source_sha256}"
+    return UUID(
+        bytes=hashlib.sha256(fingerprint.encode("ascii")).digest()[:16], version=8
+    )
 
 
 def _read_limited(source: BinaryIO, known_size: int | None, limit: int) -> bytes:

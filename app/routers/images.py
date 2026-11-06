@@ -3,7 +3,16 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, FastAPI, File, Request, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    File,
+    Path,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse
 
 from app.dependencies import AccountDep, require_image_service
@@ -89,6 +98,16 @@ def create_image(
 def list_images(account: AccountDep, request: Request) -> ImageListResponse:
     """List images stored for the account, oldest first."""
     return require_image_service(request).list_images(account)
+
+
+@router.get("/by-source/{source_sha256}", response_model=ImageResponse)
+def find_image_source(
+    source_sha256: Annotated[str, Path(pattern=r"^[0-9a-f]{64}$")],
+    account: AccountDep,
+    request: Request,
+) -> ImageResponse:
+    """Reuse an account-owned upload without transferring or recompressing it."""
+    return require_image_service(request).get_by_source(account, source_sha256)
 
 
 @router.put("/{image_id}/portrait", response_model=ImageResponse)

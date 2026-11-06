@@ -296,9 +296,6 @@ def _shrink_to_budget(
     if high < 1:
         raise ImageInvalid()
     probe = _probe_edge(long_edge, measured_bytes, limit, low, high)
-    best_data: bytes | None = None
-    best_width = 0
-    best_height = 0
     for _ in range(_SHRINK_STEPS):
         if low > high:
             break
@@ -311,21 +308,26 @@ def _shrink_to_budget(
         data, width, height = encoded
         actual_edge = max(width, height)
         if len(data) <= limit:
-            best_data = data
-            best_width = width
-            best_height = height
-            low = actual_edge + 1
-            if low > high:
-                break
-            probe = (low + high) // 2
-            continue
+            # Keep the first safe result. If it leaves substantial space, use
+            # its measured size for just one larger candidate. Binary-searching
+            # upward used to spend up to eight encodes refining a safe image.
+            if len(data) < limit * 0.85 and actual_edge < high:
+                edge = min(
+                    high,
+                    max(
+                        actual_edge + 1,
+                        int(actual_edge * math.sqrt(limit / len(data)) * 0.95),
+                    ),
+                )
+                refined = _encode_edge(image, edge, pipeline)
+                if refined is not None and len(refined[0]) <= limit:
+                    return refined
+            return data, width, height
         high = min(high, actual_edge - 1)
         if high < low:
             break
         probe = _probe_edge(actual_edge, len(data), limit, low, high)
-    if best_data is None:
-        raise ImageInvalid()
-    return best_data, best_width, best_height
+    raise ImageInvalid()
 
 
 def _probe_edge(

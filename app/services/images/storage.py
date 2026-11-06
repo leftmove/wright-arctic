@@ -105,6 +105,7 @@ class S3ImageStore:
         if_absent: bool = False,
         variant: bool = False,
         created_at: datetime | None = None,
+        source_sha256: str | None = None,
     ) -> bool:
         """Write one recompressed image."""
         if len(image.data) > MAX_STORED_BYTES:
@@ -124,6 +125,8 @@ class S3ImageStore:
             }
             if created_at is not None:
                 metadata["created_at"] = created_at.isoformat()
+            if source_sha256 is not None:
+                metadata["source_sha256"] = source_sha256
             request: PutObjectRequestTypeDef = {
                 "Bucket": self._bucket,
                 "Key": key,
@@ -425,6 +428,7 @@ def _object_from_head(
         width=_dimension(metadata, "width"),
         height=_dimension(metadata, "height"),
         channels=_dimension(metadata, "channels") if extension == "jxl" else None,
+        source_sha256=metadata.get("source_sha256"),
     )
 
 

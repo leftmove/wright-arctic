@@ -1,8 +1,12 @@
 """Canonical codec, compatibility, quota and migration regressions."""
 
+import hashlib
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from io import BytesIO
+from threading import Barrier
+from unittest.mock import patch
 from uuid import uuid4
 
 import imagecodecs
@@ -10,7 +14,13 @@ import numpy as np
 from PIL import Image, ImageCms
 
 from app.accounts import Account
-from app.services.images.errors import ImageNotFound, ImageUnsupported
+from app.services.images import processing
+from app.services.images.errors import (
+    ImageNotFound,
+    ImageQuotaExceeded,
+    ImageUnsupported,
+    StorageInvalid,
+)
 from app.services.images.models import ProcessedImage
 from app.services.images.processing import ImagePipeline, process_image
 from app.services.images.service import ImageService
@@ -30,6 +40,107 @@ def png(*, alpha: bool = False, profile: bytes | None = None) -> bytes:
 
 
 class ImageFormatTests(unittest.TestCase):
+    def test_oversized_graphics_fit_the_budget_without_repeated_refinement(
+        self,
+    ) -> None:
+        pixels = np.random.default_rng(42).integers(
+            0, 256, (300, 400, 3), dtype=np.uint8
+        )
+        stream = BytesIO()
+        Image.fromarray(pixels).save(stream, format="PNG")
+        with patch(
+            "app.services.images.processing._encode", wraps=processing._encode
+        ) as encode:
+            fitted = process_image(
+                stream.getvalue(), ImagePipeline(max_stored_bytes=32 * 1024)
+            )
+        self.assertLessEqual(len(fitted.data), 32 * 1024)
+        self.assertGreater(min(fitted.width, fitted.height), 1)
+        self.assertLessEqual(encode.call_count, 3)
+        decoded = imagecodecs.jpegxl_decode(fitted.data)
+        self.assertEqual(decoded.shape, (fitted.height, fitted.width, 3))
+
+    def test_source_reuse_survives_restart_quota_and_deletion(self) -> None:
+        client = memory_storage()
+        store = S3ImageStore(client, "images", None, 900)
+        account = Account(id="writer", issuer="https://issuer.example")
+        payload = png()
+        digest = hashlib.sha256(payload).hexdigest()
+        service = ImageService(store)
+        first = service.create(account, BytesIO(payload), None)
+        self.assertEqual(client.put_object.call_args.kwargs["IfNoneMatch"], "*")
+        restarted = ImageService(store)
+        with patch(
+            "app.services.images.service.process_image",
+            side_effect=AssertionError("encoded a duplicate"),
+        ):
+            self.assertEqual(restarted.get_by_source(account, digest).id, first.id)
+            with patch.object(store, "count_images", return_value=10):
+                self.assertEqual(
+                    restarted.create(account, BytesIO(payload), None).id, first.id
+                )
+                with self.assertRaises(ImageQuotaExceeded):
+                    restarted.create(account, BytesIO(png(alpha=True)), None)
+        self.assertEqual(client.put_object.call_count, 1)
+        for other in (
+            Account(id="other", issuer=account.issuer),
+            Account(id=account.id, issuer="https://other.example"),
+        ):
+            with self.assertRaises(ImageNotFound):
+                restarted.get_by_source(other, digest)
+        restarted.delete_image(account, first.id)
+        with self.assertRaises(ImageNotFound):
+            restarted.get_by_source(account, digest)
+        replacement = restarted.create(account, BytesIO(payload), None)
+        self.assertEqual(replacement.id, first.id)
+        self.assertEqual(client.put_object.call_count, 2)
+
+    def test_source_lookup_checks_the_full_digest_and_cannot_overwrite_mismatched_metadata(
+        self,
+    ) -> None:
+        client = memory_storage()
+        store = S3ImageStore(client, "images", None, 900)
+        account = Account(id="writer", issuer="https://issuer.example")
+        payload = png()
+        service = ImageService(store)
+        image = service.create(account, BytesIO(payload), None)
+        store.put_image(
+            account,
+            image.id,
+            process_image(payload, ImagePipeline()),
+            source_sha256="0" * 64,
+        )
+        with self.assertRaises(StorageInvalid):
+            service.get_by_source(account, hashlib.sha256(payload).hexdigest())
+        with self.assertRaises(StorageInvalid):
+            service.create(account, BytesIO(payload), None)
+        self.assertEqual(client.put_object.call_count, 2)
+
+    def test_concurrent_duplicate_uploads_converge_on_one_immutable_object(
+        self,
+    ) -> None:
+        client = memory_storage()
+        store = S3ImageStore(client, "images", None, 900)
+        account = Account(id="writer", issuer="https://issuer.example")
+        payload = png()
+        service = ImageService(store)
+        ready = Barrier(2)
+
+        def encode(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
+            # Both requests must miss before either can publish its object.
+            ready.wait(timeout=5)
+            return process_image(payload, pipeline)
+
+        with (
+            patch("app.services.images.service.process_image", side_effect=encode),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            first = pool.submit(service.create, account, BytesIO(payload), None)
+            second = pool.submit(service.create, account, BytesIO(payload), None)
+            self.assertEqual(first.result(timeout=10).id, second.result(timeout=10).id)
+        self.assertEqual(store.count_images(account, maximum=11), 1)
+        self.assertEqual(client.put_object.call_count, 2)
+
     def test_indexed_png_profile_is_applied_after_expanding_palette(self) -> None:
         profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
         stream = BytesIO()
@@ -78,6 +189,9 @@ class ImageFormatTests(unittest.TestCase):
                 assert isinstance(pixel, tuple)
                 self.assertEqual(pixel[3], 128)
         self.assertEqual(client.put_object.call_count, 3)
+        reused = service.create(account, BytesIO(png(alpha=True)), None, format="webp")
+        self.assertEqual(reused.id, image.id)
+        self.assertEqual(reused.media_type, "image/webp")
         service.get_image(account, image.id, format="avif")
         self.assertEqual(client.put_object.call_count, 3)
         self.assertEqual(store.count_images(account, maximum=11), 1)

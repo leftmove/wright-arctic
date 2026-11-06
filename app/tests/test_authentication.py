@@ -1,6 +1,7 @@
 """Exercise real signatures, hostile credentials, key rotation and image isolation."""
 
 import asyncio
+import hashlib
 import json
 import time
 import unittest
@@ -329,6 +330,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
         async with self.application() as (client, _):
             for method, path in (
                 ("GET", "/images"),
+                ("GET", "/images/by-source/" + "0" * 64),
                 ("POST", "/images"),
                 ("GET", "/images/" + str(uuid4())),
                 ("DELETE", "/images/" + str(uuid4())),
@@ -496,11 +498,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             images.delete_image.assert_called_once_with(account, image_id)
 
     async def test_real_image_upload_is_stored_in_the_verified_namespace(self) -> None:
-        storage_client = Mock()
-        storage_client.list_objects_v2.return_value = {"Contents": []}
-        storage_client.generate_presigned_url.return_value = (
-            "https://images.example/signed"
-        )
+        storage_client = memory_storage()
         images = ImageService(S3ImageStore(storage_client, "images", None, 900))
         source = BytesIO()
         Image.new("RGB", (2, 2), "red").save(source, format="PNG")
@@ -521,6 +519,24 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 storage_client.put_object.call_args.kwargs["ContentType"],
                 ("image/jxl",),
             )
+            path = "/images/by-source/" + hashlib.sha256(source.getvalue()).hexdigest()
+            headers = {"Authorization": "Bearer " + token(self.private_key)}
+            lookup = await client.get(path, headers=headers)
+            self.assertEqual(lookup.status_code, 200, lookup.text)
+            self.assertEqual(lookup.json()["id"], response.json()["id"])
+            other = await client.get(
+                path,
+                headers={
+                    "Authorization": "Bearer "
+                    + token(self.private_key, claims={"sub": "other-account"})
+                },
+            )
+            self.assertEqual(other.status_code, 404)
+            malformed = await client.get(
+                "/images/by-source/not-a-digest", headers=headers
+            )
+            self.assertEqual(malformed.status_code, 422)
+            self.assertEqual(storage_client.put_object.call_count, 1)
 
     async def test_portrait_import_is_webp_bounded_and_idempotent(self) -> None:
         storage_client = memory_storage()
