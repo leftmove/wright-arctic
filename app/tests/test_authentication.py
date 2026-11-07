@@ -38,7 +38,7 @@ from app.services.images.storage import S3ImageStore, account_prefix, object_key
 from app.settings import Settings
 from app.tests.image_storage import memory_storage
 
-_ISSUER = "https://issuer.example"
+_ISSUER = "https://issuer.example/auth/v1"
 _JWKS = _ISSUER + "/.well-known/jwks.json"
 
 
@@ -47,6 +47,10 @@ def configuration(**overrides: JsonValue) -> Settings:
         {
             "auth_issuer": _ISSUER,
             "auth_jwks_url": _JWKS,
+            "auth_publishable_key": None
+            if overrides.get("auth_issuer", _ISSUER) is None
+            else "sb_publishable_test",
+            "auth_algorithm": "RS256",
             **overrides,
         }
     )
@@ -62,9 +66,17 @@ def token(
     now = int(time.time())
     payload: dict[str, JsonValue] = {
         "iss": _ISSUER,
-        "sub": "native-account-id",
-        "aud": "convex",
+        "sub": "11111111-1111-4111-8111-111111111111",
+        "aud": "authenticated",
         "iat": now - 1,
+        "role": "authenticated",
+        "is_anonymous": False,
+        "session_id": "33333333-3333-4333-8333-333333333333",
+        "aal": "aal2",
+        "amr": [
+            {"method": "password", "timestamp": now - 1},
+            {"method": "totp", "timestamp": now - 1},
+        ],
         "exp": now + 899,
     }
     if claims is not None:
@@ -91,12 +103,20 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
         cls.other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
     async def asyncSetUp(self) -> None:
+        self.policy = True
+        self.policy_status = 200
+        self.policy_fetches = 0
         self.fetches = 0
         self.status = 200
         self.document: dict[str, JsonValue] = {"keys": [public_jwk(self.private_key)]}
         self.body: bytes | None = None
 
         def fetch(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/rest/v1/rpc/account_access":
+                self.policy_fetches += 1
+                self.assertTrue(request.headers["authorization"].startswith("Bearer "))
+                self.assertEqual(request.headers["apikey"], "sb_publishable_test")
+                return httpx.Response(self.policy_status, json=self.policy)
             self.fetches += 1
             self.assertEqual(str(request.url), _JWKS)
             self.assertNotIn("authorization", request.headers)
@@ -117,7 +137,9 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
         renewed = await self.service.authenticate(
             token(self.private_key, claims={"jti": "renewed"})
         )
-        self.assertEqual(first, Account(id="native-account-id", issuer=_ISSUER))
+        self.assertEqual(
+            first, Account(id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER)
+        )
         self.assertEqual(first.storage_key, renewed.storage_key)
         self.assertNotEqual(
             first.storage_key,
@@ -128,13 +150,56 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_audience_arrays_are_accepted(self) -> None:
         account = await self.service.authenticate(
-            token(self.private_key, claims={"aud": ["other", "convex"]})
+            token(self.private_key, claims={"aud": ["other", "authenticated"]})
         )
-        self.assertEqual(account.id, "native-account-id")
+        self.assertEqual(account.id, "11111111-1111-4111-8111-111111111111")
 
     async def test_signature_forgery_is_rejected(self) -> None:
         with self.assertRaises(InvalidCredentials):
             await self.service.authenticate(token(self.other_key))
+
+    async def test_current_session_factor_policy_is_rechecked_on_every_request(
+        self,
+    ) -> None:
+        value = token(self.private_key)
+        await self.service.authenticate(value)
+        self.policy = False
+        with self.assertRaises(InvalidCredentials):
+            await self.service.authenticate(value)
+        self.policy = True
+        self.policy_status = 503
+        with self.assertRaises(AuthenticationUnavailable):
+            await self.service.authenticate(value)
+        self.assertEqual(self.policy_fetches, 3)
+        self.assertEqual(self.fetches, 1)
+
+    async def test_first_factor_maintenance_and_linked_google_do_not_grant_access(
+        self,
+    ) -> None:
+        for methods, assurance in (
+            (["password"], "aal1"),
+            (["passkey"], "aal1"),
+            (["recovery", "totp"], "aal2"),
+            (["email/signup", "totp"], "aal2"),
+            (["oauth_provider/authorization_code"], "aal1"),
+        ):
+            claims: dict[str, JsonValue] = {
+                "aal": assurance,
+                "amr": [
+                    {"method": method, "timestamp": int(time.time())}
+                    for method in methods
+                ],
+                "app_metadata": {"providers": ["google"]},
+            }
+            with self.subTest(methods=methods), self.assertRaises(InvalidCredentials):
+                await self.service.authenticate(token(self.private_key, claims=claims))
+        self.assertEqual(self.policy_fetches, 0)
+        google: dict[str, JsonValue] = {
+            "aal": "aal1",
+            "amr": [{"method": "oauth", "timestamp": int(time.time())}],
+        }
+        await self.service.authenticate(token(self.private_key, claims=google))
+        self.assertEqual(self.policy_fetches, 1)
 
     async def test_invalid_scope_and_claim_types_are_rejected(self) -> None:
         now = int(time.time())
@@ -303,7 +368,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             configuration(auth_algorithm="ES256"), self.client
         )
         account = await es_service.authenticate(token(private, algorithm="ES256"))
-        self.assertEqual(account.id, "native-account-id")
+        self.assertEqual(account.id, "11111111-1111-4111-8111-111111111111")
         with self.assertRaises(InvalidCredentials):
             await self.service.authenticate(token(private, algorithm="ES256"))
 
@@ -450,7 +515,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.status_code, 200)
             images.list_images.assert_called_once_with(
-                Account(id="native-account-id", issuer=_ISSUER)
+                Account(id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER)
             )
 
     async def test_jwks_outage_is_retryable_and_does_not_leak_credentials(self) -> None:
@@ -480,7 +545,7 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
         )
         images.get_image.return_value = images.create.return_value
         headers = {"Authorization": "Bearer " + token(self.private_key)}
-        account = Account(id="native-account-id", issuer=_ISSUER)
+        account = Account(id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER)
         async with self.application(images) as (client, _):
             response = await client.post(
                 "/images",
@@ -512,7 +577,11 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             key = storage_client.put_object.call_args.kwargs["Key"]
             self.assertTrue(
                 key.startswith(
-                    account_prefix(Account(id="native-account-id", issuer=_ISSUER))
+                    account_prefix(
+                        Account(
+                            id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER
+                        )
+                    )
                 )
             )
             self.assertIn(
@@ -529,7 +598,10 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
                 path,
                 headers={
                     "Authorization": "Bearer "
-                    + token(self.private_key, claims={"sub": "another-account"})
+                    + token(
+                        self.private_key,
+                        claims={"sub": "22222222-2222-4222-8222-222222222222"},
+                    )
                 },
             )
             self.assertEqual(other.status_code, 404)
@@ -591,6 +663,60 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.status_code, 413)
 
+    async def test_portrait_selection_is_owned_and_automatic_import_cannot_replace_it(
+        self,
+    ) -> None:
+        images = ImageService(S3ImageStore(memory_storage(), "images", None, 900))
+        async with self.application(images) as (client, _):
+            headers = {"Authorization": "Bearer " + token(self.private_key)}
+            self.assertIsNone(
+                (await client.get("/account/portrait", headers=headers)).json()
+            )
+            ids: list[str] = []
+            for color in ("red", "blue"):
+                source = BytesIO()
+                Image.new("RGB", (2, 2), color).save(source, format="PNG")
+                response = await client.post(
+                    "/images",
+                    headers=headers,
+                    files={"file": ("portrait.png", source.getvalue(), "image/png")},
+                )
+                self.assertEqual(response.status_code, 201)
+                ids.append(response.json()["id"])
+            selected = await client.put(
+                "/account/portrait", headers=headers, json={"image_id": ids[0]}
+            )
+            self.assertEqual(selected.status_code, 200, selected.text)
+            self.assertEqual(selected.json()["id"], ids[0])
+            automatic = await client.put(
+                "/account/portrait",
+                headers=headers,
+                json={"image_id": ids[1], "if_absent": True},
+            )
+            self.assertEqual(automatic.json()["id"], ids[0])
+            other = {
+                "Authorization": "Bearer "
+                + token(
+                    self.private_key,
+                    claims={"sub": "22222222-2222-4222-8222-222222222222"},
+                )
+            }
+            self.assertIsNone(
+                (await client.get("/account/portrait", headers=other)).json()
+            )
+            self.assertEqual(
+                (
+                    await client.put(
+                        "/account/portrait", headers=other, json={"image_id": ids[0]}
+                    )
+                ).status_code,
+                404,
+            )
+            await client.delete("/images/" + ids[0], headers=headers)
+            self.assertIsNone(
+                (await client.get("/account/portrait", headers=headers)).json()
+            )
+
     async def test_unconfigured_authentication_fails_closed(self) -> None:
         with (
             patch(
@@ -626,9 +752,8 @@ class ConfigurationAndStorageTests(unittest.TestCase):
         ):
             with self.subTest(overrides=overrides), self.assertRaises(ValidationError):
                 configuration(**overrides)
-        self.assertEqual(
-            configuration(auth_issuer=_ISSUER + "/").auth_issuer, _ISSUER + "/"
-        )
+        with self.assertRaises(ValidationError):
+            configuration(auth_issuer=_ISSUER + "/")
         self.assertIsNone(
             build_authentication_service(
                 configuration(auth_issuer=None, auth_jwks_url=None)
@@ -657,7 +782,7 @@ class ConfigurationAndStorageTests(unittest.TestCase):
         )
 
     def test_other_accounts_cannot_read_delete_or_list_an_image(self) -> None:
-        owner = Account(id="native-account-id", issuer=_ISSUER)
+        owner = Account(id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER)
         other = Account(id="other-account-id", issuer=_ISSUER)
         image_id = uuid4()
         owner_key = object_key(owner, image_id, "webp")

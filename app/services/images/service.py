@@ -58,6 +58,23 @@ class ImageService:
         """Release the storage client."""
         self._store.close()
 
+    def portrait(
+        self, account: Account, *, format: DeliveryFormat = "webp"
+    ) -> ImageResponse | None:
+        image_id = self._store.portrait_id(account)
+        if image_id is None:
+            return None
+        try:
+            return self.get_image(account, image_id, format=format)
+        except ImageNotFound:
+            return None
+
+    def select_portrait(
+        self, account: Account, image_id: UUID, *, if_absent: bool = False
+    ) -> ImageResponse | None:
+        self._store.select_portrait(account, image_id, if_absent=if_absent)
+        return self.portrait(account)
+
     def create(
         self,
         account: Account,

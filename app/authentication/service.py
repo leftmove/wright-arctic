@@ -1,13 +1,15 @@
 """Verify native access JWTs without handling passwords or renewal secrets."""
 
+import asyncio
 import re
+from uuid import UUID
 
 import httpx
 import jwt
 from pydantic import ValidationError
 
 from app.accounts import Account
-from app.authentication.errors import InvalidCredentials
+from app.authentication.errors import AuthenticationUnavailable, InvalidCredentials
 from app.authentication.jwks import SigningKeys
 from app.authentication.models import AccessClaims, TokenHeader
 from app.settings import Settings
@@ -32,6 +34,12 @@ class AuthenticationService:
         self._algorithm = settings.auth_algorithm
         self._max_lifetime = settings.auth_max_token_lifetime_seconds
         self._client = client
+        if settings.auth_publishable_key is None:
+            raise ValueError("Authentication requires the project's publishable key")
+        self._publishable_key = settings.auth_publishable_key
+        self._policy_url = (
+            self._issuer.removesuffix("/auth/v1") + "/rest/v1/rpc/account_access"
+        )
         self._keys = SigningKeys(client, str(settings.auth_jwks_url), self._algorithm)
 
     async def close(self) -> None:
@@ -66,7 +74,62 @@ class AuthenticationService:
             or any(ord(char) < 32 or ord(char) == 127 for char in claims.sub)
         ):
             raise InvalidCredentials()
+        try:
+            if (
+                str(UUID(claims.sub)) != claims.sub
+                or str(UUID(claims.session_id)) != claims.session_id
+            ):
+                raise InvalidCredentials()
+        except ValueError:
+            raise InvalidCredentials() from None
+        methods = {entry.method for entry in claims.amr}
+        if "oauth" not in methods and not (
+            claims.aal == "aal2"
+            and methods.intersection({"password", "passkey"})
+            and methods.intersection({"totp", "mfa/totp"})
+        ):
+            raise InvalidCredentials()
+        await self._check_policy(token)
         return Account(id=claims.sub, issuer=claims.iss)
+
+    async def _check_policy(self, token: str) -> None:
+        """Use the caller's exact token; no service key or subject delegation.
+
+        SQL checks the current managed session, email and factor association.
+        Positive decisions are deliberately not cached across requests.
+        """
+        try:
+            async with asyncio.timeout(5):
+                async with self._client.stream(
+                    "POST",
+                    self._policy_url,
+                    content=b"{}",
+                    headers={
+                        "Authorization": "Bearer " + token,
+                        "apikey": self._publishable_key.get_secret_value(),
+                        "Content-Type": "application/json",
+                        "Accept-Encoding": "identity",
+                    },
+                ) as response:
+                    if response.status_code in (401, 403):
+                        raise InvalidCredentials()
+                    if (
+                        response.status_code != 200
+                        or response.headers.get("Content-Encoding", "identity").lower()
+                        != "identity"
+                    ):
+                        raise AuthenticationUnavailable()
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if len(body) + len(chunk) > 16:
+                            raise AuthenticationUnavailable()
+                        body.extend(chunk)
+            if body.strip() == b"false":
+                raise InvalidCredentials()
+            if body.strip() != b"true":
+                raise AuthenticationUnavailable()
+        except httpx.HTTPError, TimeoutError:
+            raise AuthenticationUnavailable() from None
 
 
 def build_authentication_service(settings: Settings) -> AuthenticationService | None:
