@@ -18,7 +18,7 @@ class ImageTooLarge(ImageServiceError):
         super().__init__(
             413,
             "image_too_large",
-            f"Image uploads are limited to {_mebibytes(MAX_UPLOAD_BYTES)} MiB.",
+            f"Image uploads are limited to {MAX_UPLOAD_BYTES // 1024} KiB.",
         )
 
 
@@ -28,11 +28,13 @@ class ImageEmpty(ImageServiceError):
 
 
 class ImageUnsupported(ImageServiceError):
-    def __init__(self) -> None:
+    def __init__(
+        self, message: str = "Upload a JPEG, PNG, WebP, or static GIF."
+    ) -> None:
         super().__init__(
             415,
             "image_unsupported",
-            "Upload a JPEG, PNG, WebP, AVIF, or static GIF.",
+            message,
         )
 
 

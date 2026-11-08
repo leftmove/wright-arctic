@@ -18,10 +18,9 @@ from pathlib import Path
 from typing import IO, cast
 from uuid import UUID
 
-from psycopg.types.json import Jsonb
-
 from app.services.documents.database import Row, Session
 from app.services.documents.errors import Conflict, Unavailable
+from app.services.documents.values import JsonParameter
 
 
 def _encode(value: object) -> object:
@@ -31,7 +30,7 @@ def _encode(value: object) -> object:
         return str(value)
     if isinstance(value, datetime):
         return value.isoformat()
-    if isinstance(value, Jsonb):
+    if isinstance(value, JsonParameter):
         return value.obj
     return value
 

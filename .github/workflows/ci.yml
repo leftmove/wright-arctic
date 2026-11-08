@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: leftmove/wright-pacific
-          ref: e7b66ef489af24e7c089d9cb13b8545b051abbc8
+          ref: 1cfa2f501e8f9a57865152ce869da93c74024b9b
           token: ${{ secrets.WRIGHT_NATIVE_READ_TOKEN }}
           path: .native-codec
           persist-credentials: false

@@ -129,7 +129,7 @@ class DocumentBodyLimitMiddleware:
         ] not in {"POST", "PUT", "PATCH"}:
             await self._app(scope, receive, send)
             return
-        maximum = (17 if path.endswith("/changes") else 65) * 1024 * 1024
+        maximum = 2 * 1024 * 1024
         try:
             if any(length > maximum for length in _content_lengths(scope)):
                 raise ImageTooLarge()

@@ -15,14 +15,14 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse
 
-from app.dependencies import AccountDep, require_image_service
+from app.dependencies import AccountDep, execute, require_image_service
 from app.schemas import ErrorResponse, ImageListResponse, ImageResponse, error_body
 from app.services.images.content import SOURCE_SHA256_PATTERN
 from app.services.images.errors import ImageServiceError
 from app.services.images.limits import MAX_STORED_BYTES, MAX_UPLOAD_BYTES
 from app.services.images.models import DeliveryFormat
 
-_UPLOAD_MIB = MAX_UPLOAD_BYTES // (1024 * 1024)
+_UPLOAD_KIB = MAX_UPLOAD_BYTES // 1024
 _STORED_MIB = MAX_STORED_BYTES // (1024 * 1024)
 
 router = APIRouter(
@@ -60,7 +60,7 @@ router = APIRouter(
         },
         status.HTTP_413_CONTENT_TOO_LARGE: {
             "model": ErrorResponse,
-            "description": f"The upload is larger than {_UPLOAD_MIB} MiB.",
+            "description": f"The upload is larger than {_UPLOAD_KIB} KiB.",
         },
         status.HTTP_415_UNSUPPORTED_MEDIA_TYPE: {
             "model": ErrorResponse,
@@ -68,7 +68,7 @@ router = APIRouter(
         },
     },
 )
-def create_image(
+async def create_image(
     account: AccountDep,
     request: Request,
     response: Response,
@@ -77,7 +77,7 @@ def create_image(
         File(
             description=(
                 "JPEG, PNG, WebP, AVIF, or static GIF. "
-                f"Maximum upload size is {_UPLOAD_MIB} MiB. "
+                f"Maximum upload size is {_UPLOAD_KIB} KiB. "
                 f"The stored object is at most {_STORED_MIB} MiB."
             )
         ),
@@ -85,22 +85,22 @@ def create_image(
 ) -> ImageResponse:
     """Store a general-purpose image.
 
-    The upload is limited to 10 MiB. JPEG, PNG, WebP, AVIF, and static GIF are
+    The upload is limited to 512 KiB. JPEG, PNG, WebP, AVIF, and static GIF are
     normalized to sRGB, stripped of metadata and recompressed to JPEG XL. The stored
     object is at most 1 MiB. Exact source bytes reuse the account's existing image,
     including when its quota is full. Concurrent duplicates share one immutable
     object. Each account can store 10 distinct images.
     """
     images = require_image_service(request)
-    image = images.create(account, file.file, file.size)
+    image = await execute(request, images.create, account, file.file, file.size)
     response.headers["Location"] = f"/images/{image.id}"
     return image
 
 
 @router.get("", response_model=ImageListResponse)
-def list_images(account: AccountDep, request: Request) -> ImageListResponse:
+async def list_images(account: AccountDep, request: Request) -> ImageListResponse:
     """List images stored for the account, oldest first."""
-    return require_image_service(request).list_images(account)
+    return await execute(request, require_image_service(request).list_images, account)
 
 
 @router.get(
@@ -113,7 +113,7 @@ def list_images(account: AccountDep, request: Request) -> ImageListResponse:
         },
     },
 )
-def image_by_source(
+async def image_by_source(
     source_sha256: Annotated[str, Path(pattern=SOURCE_SHA256_PATTERN)],
     account: AccountDep,
     request: Request,
@@ -124,20 +124,29 @@ def image_by_source(
     returns 404; uploading those bytes through POST /images populates the cache.
     The response contains a fresh delivery URL, never a cached expiring URL.
     """
-    return require_image_service(request).get_by_source(account, source_sha256)
+    return await execute(
+        request, require_image_service(request).get_by_source, account, source_sha256
+    )
 
 
 @router.put("/{image_id}/portrait", response_model=ImageResponse)
-def import_portrait(
+async def import_portrait(
     image_id: UUID,
     account: AccountDep,
     request: Request,
-    file: Annotated[UploadFile, File(description="Profile picture, at most 10 MiB.")],
+    file: Annotated[UploadFile, File(description="Profile picture, at most 512 KiB.")],
     format: DeliveryFormat = "webp",
 ) -> ImageResponse:
     """Import an immutable JPEG XL portrait and select a delivery format."""
-    return require_image_service(request).create(
-        account, file.file, file.size, image_id=image_id, portrait=True, format=format
+    return await execute(
+        request,
+        require_image_service(request).create,
+        account,
+        file.file,
+        file.size,
+        image_id=image_id,
+        portrait=True,
+        format=format,
     )
 
 
@@ -151,14 +160,20 @@ def import_portrait(
         },
     },
 )
-def read_image(
+async def read_image(
     image_id: UUID,
     account: AccountDep,
     request: Request,
     format: DeliveryFormat = "webp",
 ) -> ImageResponse:
     """Return one stored image and a URL that fetches its bytes."""
-    return require_image_service(request).get_image(account, image_id, format=format)
+    return await execute(
+        request,
+        require_image_service(request).get_image,
+        account,
+        image_id,
+        format=format,
+    )
 
 
 @router.delete(
@@ -172,9 +187,13 @@ def read_image(
         },
     },
 )
-def delete_image(image_id: UUID, account: AccountDep, request: Request) -> Response:
+async def delete_image(
+    image_id: UUID, account: AccountDep, request: Request
+) -> Response:
     """Delete one stored image belonging to the account."""
-    require_image_service(request).delete_image(account, image_id)
+    await execute(
+        request, require_image_service(request).delete_image, account, image_id
+    )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -183,7 +202,7 @@ def install_image_error_handler(application: FastAPI) -> None:
     application.add_exception_handler(ImageServiceError, _handle_image_error)
 
 
-def _handle_image_error(_request: Request, exc: Exception) -> JSONResponse:
+async def _handle_image_error(_request: Request, exc: Exception) -> JSONResponse:
     if not isinstance(exc, ImageServiceError):
         raise exc
     return JSONResponse(

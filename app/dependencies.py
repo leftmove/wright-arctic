@@ -1,6 +1,7 @@
 """Typed dependency providers shared by API routers."""
 
 import os
+from collections.abc import Callable
 from functools import lru_cache
 from typing import Annotated, cast
 
@@ -14,7 +15,13 @@ from app.services.documents.service import DocumentService
 from app.services.images.errors import StorageUnconfigured
 from app.services.images.service import ImageService
 from app.settings import Settings
-from app.state import AppResources
+from app.state import AppResources, scope_resources
+
+
+def request_resources(request: Request) -> AppResources:
+    return scope_resources(request.scope) or cast(
+        AppResources, request.app.state.resources
+    )
 
 
 @lru_cache
@@ -35,7 +42,7 @@ async def get_current_account(
     _credential: Annotated[HTTPAuthorizationCredentials | None, Security(_bearer)],
 ) -> Account:
     """Return the verified identity, reusing the middleware's request-local result."""
-    resources = cast(AppResources, request.app.state.resources)
+    resources = request_resources(request)
     return await authenticate_request(request, resources.authentication)
 
 
@@ -45,18 +52,31 @@ def require_image_service(request: Request) -> ImageService:
     FastAPI runs dependencies before it turns parameter errors into a 422, so
     this is called from handlers instead of being declared with Depends.
     """
-    resources = cast(AppResources, request.app.state.resources)
+    resources = request_resources(request)
     if resources.image_service is None:
         raise StorageUnconfigured()
     return resources.image_service
 
 
-type SettingsDep = Annotated[Settings, Depends(get_settings)]
+async def request_settings(request: Request) -> Settings:
+    """Use this application's settings without starting a dependency worker thread."""
+    resources = request_resources(request)
+    return resources.settings if resources.settings is not None else get_settings()
+
+
+async def execute[**P, T](
+    request: Request, function: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+) -> T:
+    resources = request_resources(request)
+    return await resources.executor.run(function, *args, **kwargs)
+
+
+type SettingsDep = Annotated[Settings, Depends(request_settings)]
 type AccountDep = Annotated[Account, Depends(get_current_account)]
 
 
 def require_document_service(request: Request) -> DocumentService:
-    resources = cast(AppResources, request.app.state.resources)
+    resources = request_resources(request)
     if resources.document_service is None:
         raise Unavailable()
     return resources.document_service

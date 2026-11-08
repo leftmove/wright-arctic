@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BUCKET_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 _REGION_NAME = re.compile(r"^[a-z0-9-]{1,32}$")
+_AUTH_URL = TypeAdapter(AnyHttpUrl)
 
 
 class Settings(BaseSettings):
@@ -66,7 +67,7 @@ class Settings(BaseSettings):
         if value is not None:
             if value != value.strip():
                 raise ValueError("must not include surrounding whitespace")
-            _secure_auth_url(TypeAdapter(AnyHttpUrl).validate_python(value))
+            _secure_auth_url(_AUTH_URL.validate_python(value))
         # JWT issuer comparison is exact: preserve paths and trailing slashes.
         return value
 

@@ -1,14 +1,17 @@
 """Private server-side SQL sessions; verified actors are passed as parameters."""
 
+from __future__ import annotations
+
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
-from psycopg import Connection, Error, OperationalError
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool, PoolTimeout, TooManyRequests
+if TYPE_CHECKING:
+    from psycopg import Connection
+    from psycopg_pool import ConnectionPool
 
 from app.services.documents.errors import Conflict, Unavailable
+from app.services.documents.values import JsonParameter
 
 type Row = dict[str, object]
 
@@ -28,6 +31,13 @@ class PostgresSession:
         self._connection = connection
 
     def execute(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        from psycopg.rows import dict_row
+        from psycopg.types.json import Jsonb
+
+        parameters = [
+            Jsonb(value.obj) if isinstance(value, JsonParameter) else value
+            for value in parameters
+        ]
         with self._connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(query, parameters or None)
             if cursor.description is None:
@@ -37,6 +47,8 @@ class PostgresSession:
 
 class PostgresDatabase:
     def __init__(self, url: str, *, max_connections: int = 4) -> None:
+        from psycopg_pool import ConnectionPool
+
         self._pool: ConnectionPool[Connection[tuple[object, ...]]] = ConnectionPool(
             url,
             min_size=0,
@@ -54,26 +66,16 @@ class PostgresDatabase:
 
     def open(self) -> None:
         self._pool.open()
-        with self.transaction() as session:
-            # Authentication is enforced by Arctic. Storage must be private to
-            # its backend role; neither a Supabase client nor schema owner.
-            rows = session.execute("""select r.rolsuper, r.rolbypassrls,
-                exists(select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
-                  where n.nspname='documents' and c.relowner=r.oid) as owns_storage
-                from pg_roles r where r.rolname=current_user""")
-            if not rows or any(rows[0].values()):
-                raise Unavailable()
-            flags = session.execute("""select c.relrowsecurity from pg_class c join pg_namespace n
-                on n.oid=c.relnamespace where n.nspname='documents' and c.relkind='r'""")
-            if len(flags) != 7 or any(row["relrowsecurity"] for row in flags):
-                raise Unavailable()
-            session.execute("select id from documents.documents limit 0")
+        verify_runtime(self)
 
     def close(self) -> None:
         self._pool.close()
 
     @contextmanager
     def transaction(self) -> Iterator[Session]:
+        from psycopg import Error, OperationalError
+        from psycopg_pool import PoolTimeout, TooManyRequests
+
         try:
             with self._pool.connection() as connection, connection.transaction():
                 session = PostgresSession(connection)
@@ -83,8 +85,32 @@ class PostgresDatabase:
         except PoolTimeout, TooManyRequests, OperationalError:
             raise Unavailable() from None
         except Error as error:
-            if error.sqlstate in {"40001", "40P01", "55P03"}:
-                raise Conflict("retry_transaction") from None
-            if error.sqlstate in {"23505", "23503", "23514", "23001"}:
-                raise Conflict() from None
-            raise Unavailable() from None
+            raise_database_error(error.sqlstate)
+
+
+def raise_database_error(sqlstate: str | None) -> NoReturn:
+    if sqlstate in {"40001", "40P01", "55P03"}:
+        raise Conflict("retry_transaction") from None
+    if sqlstate in {"23505", "23503", "23514", "23001"}:
+        raise Conflict() from None
+    raise Unavailable() from None
+
+
+def verify_runtime(database: Database) -> None:
+    """Verify the existing private schema using only the runtime login."""
+    with database.transaction() as session:
+        verify_session(session)
+
+
+def verify_session(session: Session) -> None:
+    rows = session.execute("""select r.rolsuper, r.rolbypassrls,
+            exists(select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
+              where n.nspname='documents' and c.relowner=r.oid) as owns_storage
+            from pg_roles r where r.rolname=current_user""")
+    if not rows or any(rows[0].values()):
+        raise Unavailable()
+    flags = session.execute("""select c.relrowsecurity from pg_class c join pg_namespace n
+            on n.oid=c.relnamespace where n.nspname='documents' and c.relkind='r'""")
+    if len(flags) != 7 or any(row["relrowsecurity"] for row in flags):
+        raise Unavailable()
+    session.execute("select id from documents.documents limit 0")

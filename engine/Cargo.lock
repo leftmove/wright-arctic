@@ -243,6 +243,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -322,6 +328,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "hashlink"
@@ -831,6 +840,7 @@ version = "0.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "700d18fa267b73b9b521fd7e13580e2f446916f176cacee1ab63fcc8191f1655"
 dependencies = [
+ "hashbrown 0.17.1",
  "libc",
  "once_cell",
  "portable-atomic",
@@ -1631,7 +1641,7 @@ dependencies = [
 [[package]]
 name = "wright-crdt"
 version = "0.1.0"
-source = "git+https://github.com/leftmove/wright-pacific.git?rev=e7b66ef489af24e7c089d9cb13b8545b051abbc8#e7b66ef489af24e7c089d9cb13b8545b051abbc8"
+source = "git+https://github.com/leftmove/wright-pacific.git?rev=1cfa2f501e8f9a57865152ce869da93c74024b9b#1cfa2f501e8f9a57865152ce869da93c74024b9b"
 dependencies = [
  "thiserror",
  "tracing",
@@ -1645,7 +1655,7 @@ dependencies = [
 [[package]]
 name = "wright-db"
 version = "0.1.0"
-source = "git+https://github.com/leftmove/wright-pacific.git?rev=e7b66ef489af24e7c089d9cb13b8545b051abbc8#e7b66ef489af24e7c089d9cb13b8545b051abbc8"
+source = "git+https://github.com/leftmove/wright-pacific.git?rev=1cfa2f501e8f9a57865152ce869da93c74024b9b#1cfa2f501e8f9a57865152ce869da93c74024b9b"
 dependencies = [
  "dirs",
  "rusqlite",
@@ -1658,7 +1668,7 @@ dependencies = [
 [[package]]
 name = "wright-document"
 version = "0.1.0"
-source = "git+https://github.com/leftmove/wright-pacific.git?rev=e7b66ef489af24e7c089d9cb13b8545b051abbc8#e7b66ef489af24e7c089d9cb13b8545b051abbc8"
+source = "git+https://github.com/leftmove/wright-pacific.git?rev=1cfa2f501e8f9a57865152ce869da93c74024b9b#1cfa2f501e8f9a57865152ce869da93c74024b9b"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1676,7 +1686,7 @@ dependencies = [
 [[package]]
 name = "wright-model"
 version = "0.1.0"
-source = "git+https://github.com/leftmove/wright-pacific.git?rev=e7b66ef489af24e7c089d9cb13b8545b051abbc8#e7b66ef489af24e7c089d9cb13b8545b051abbc8"
+source = "git+https://github.com/leftmove/wright-pacific.git?rev=1cfa2f501e8f9a57865152ce869da93c74024b9b#1cfa2f501e8f9a57865152ce869da93c74024b9b"
 dependencies = [
  "serde",
  "serde_json",
@@ -1687,7 +1697,7 @@ dependencies = [
 [[package]]
 name = "wright-rich-text"
 version = "0.1.0"
-source = "git+https://github.com/leftmove/wright-pacific.git?rev=e7b66ef489af24e7c089d9cb13b8545b051abbc8#e7b66ef489af24e7c089d9cb13b8545b051abbc8"
+source = "git+https://github.com/leftmove/wright-pacific.git?rev=1cfa2f501e8f9a57865152ce869da93c74024b9b#1cfa2f501e8f9a57865152ce869da93c74024b9b"
 dependencies = [
  "base64",
  "serde",
@@ -1701,7 +1711,7 @@ dependencies = [
 [[package]]
 name = "wright-state"
 version = "0.1.0"
-source = "git+https://github.com/leftmove/wright-pacific.git?rev=e7b66ef489af24e7c089d9cb13b8545b051abbc8#e7b66ef489af24e7c089d9cb13b8545b051abbc8"
+source = "git+https://github.com/leftmove/wright-pacific.git?rev=1cfa2f501e8f9a57865152ce869da93c74024b9b#1cfa2f501e8f9a57865152ce869da93c74024b9b"
 dependencies = [
  "tracing",
  "wright-model",
@@ -1711,7 +1721,7 @@ dependencies = [
 [[package]]
 name = "wright-transform"
 version = "0.1.0"
-source = "git+https://github.com/leftmove/wright-pacific.git?rev=e7b66ef489af24e7c089d9cb13b8545b051abbc8#e7b66ef489af24e7c089d9cb13b8545b051abbc8"
+source = "git+https://github.com/leftmove/wright-pacific.git?rev=1cfa2f501e8f9a57865152ce869da93c74024b9b#1cfa2f501e8f9a57865152ce869da93c74024b9b"
 dependencies = [
  "tracing",
  "wright-model",

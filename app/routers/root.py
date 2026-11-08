@@ -9,6 +9,6 @@ router = APIRouter(tags=["root"])
 
 
 @router.get("/", response_model=RootResponse)
-def root(settings: SettingsDep) -> RootResponse:
+async def root(settings: SettingsDep) -> RootResponse:
     """Identify the service and expose links to documentation and health."""
     return RootResponse(service=settings.app_name)

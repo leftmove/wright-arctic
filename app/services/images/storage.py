@@ -9,16 +9,14 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypeVar
 from urllib.parse import quote
 from uuid import UUID
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
 from pydantic import SecretStr
 
 from app.accounts import Account
@@ -29,21 +27,21 @@ from app.services.images.errors import (
     StorageUnavailable,
     StoredImageTooLarge,
 )
-from app.services.images.limits import MAX_DECODE_EDGE, MAX_STORED_BYTES
+from app.services.images.limits import MAX_STORED_BYTES
 from app.services.images.models import (
     ImageExtension,
     ImageMediaType,
     ImageObject,
     ProcessedImage,
 )
+from app.services.images.objects import ObjectPage, ObjectStorage, StoredObject
 from app.settings import Settings
 
 if TYPE_CHECKING:
+    from botocore.exceptions import ClientError
     from mypy_boto3_s3.client import S3Client
     from mypy_boto3_s3.type_defs import (
-        HeadObjectOutputTypeDef,
         ListObjectsV2OutputTypeDef,
-        ObjectTypeDef,
         PutObjectRequestTypeDef,
     )
 
@@ -71,18 +69,13 @@ _MISSING_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 _T = TypeVar("_T")
 
 
-class S3ImageStore:
+class ImageStore:
     """Images for one bucket, addressed by account and image id."""
 
     def __init__(
-        self,
-        client: S3Client,
-        bucket: str,
-        public_base_url: str | None,
-        presign_seconds: int,
+        self, objects: ObjectStorage, public_base_url: str | None, presign_seconds: int
     ) -> None:
-        self._client = client
-        self._bucket = bucket
+        self._objects = objects
         self._public_base_url = public_base_url
         self._presign_seconds = presign_seconds
 
@@ -94,63 +87,37 @@ class S3ImageStore:
         return self._presign_seconds
 
     def close(self) -> None:
-        """Close the underlying HTTP connection pool."""
-        self._client.close()
+        self._objects.close()
+
+    def open(self) -> None:
+        """Check bucket access without reading account objects."""
+        with suppress(ImageNotFound):
+            self._objects.head(".readiness")
 
     def portrait_id(self, account: Account) -> UUID | None:
-        """Read a small account-owned selection, separate from immutable images."""
-
-        def read() -> UUID:
-            response = self._client.get_object(
-                Bucket=self._bucket, Key=f"accounts/{account.storage_key}/portrait"
-            )
-            body = response["Body"]
-            try:
-                value = body.read(37)
-            finally:
-                body.close()
-            if len(value) != 36:
-                raise StorageInvalid()
-            try:
-                return UUID(value.decode("ascii"))
-            except ValueError, UnicodeError:
-                raise StorageInvalid() from None
-
         try:
-            return self._invoke(read, missing_ok=True)
+            value = self._objects.read(f"accounts/{account.storage_key}/portrait", 36)
         except ImageNotFound:
             return None
+        if len(value) != 36:
+            raise StorageInvalid()
+        try:
+            return UUID(value.decode("ascii"))
+        except ValueError, UnicodeError:
+            raise StorageInvalid() from None
 
     def select_portrait(
         self, account: Account, image_id: UUID, *, if_absent: bool = False
     ) -> None:
-        """Selection cannot point outside the verified account's object namespace."""
         self.get_image(account, image_id)
-
-        def write() -> None:
-            parameters: PutObjectRequestTypeDef = {
-                "Bucket": self._bucket,
-                "Key": f"accounts/{account.storage_key}/portrait",
-                "Body": str(image_id).encode("ascii"),
-                "Metadata": {},
-                "ContentType": "text/plain",
-                "CacheControl": "private, no-store",
-                "ContentDisposition": "inline",
-            }
-            if if_absent:
-                parameters["IfNoneMatch"] = "*"
-            try:
-                self._client.put_object(**parameters)
-            except ClientError as exc:
-                if if_absent and (
-                    _error_code(exc)
-                    in {"PreconditionFailed", "ConditionalRequestConflict"}
-                    or _http_status(exc) in {409, 412}
-                ):
-                    return
-                raise
-
-        self._invoke(write)
+        self._objects.put(
+            f"accounts/{account.storage_key}/portrait",
+            str(image_id).encode("ascii"),
+            media_type="text/plain",
+            cache_control="private, no-store",
+            metadata={},
+            if_absent=if_absent,
+        )
 
     def put_image(
         self,
@@ -163,68 +130,37 @@ class S3ImageStore:
         created_at: datetime | None = None,
         source_sha256: str | None = None,
     ) -> bool:
-        """Write one recompressed image."""
         if len(image.data) > MAX_STORED_BYTES:
             raise StoredImageTooLarge()
-        key = object_key(account, image_id, image.extension, variant=variant)
-        cache_control = (
-            "public, max-age=31536000, immutable"
-            if self._public_base_url is not None
-            else "private, max-age=86400"
+        metadata = {
+            "width": str(image.width),
+            "height": str(image.height),
+            "channels": str(image.channels),
+        }
+        if created_at is not None:
+            metadata["created_at"] = created_at.isoformat()
+        if source_sha256 is not None:
+            metadata["source_sha256"] = source_sha256
+        return self._objects.put(
+            object_key(account, image_id, image.extension, variant=variant),
+            image.data,
+            media_type=image.media_type,
+            cache_control="public, max-age=31536000, immutable"
+            if self._public_base_url
+            else "private, max-age=86400",
+            metadata=metadata,
+            if_absent=if_absent,
         )
-
-        def _put() -> bool:
-            metadata = {
-                "width": str(image.width),
-                "height": str(image.height),
-                "channels": str(image.channels),
-            }
-            if created_at is not None:
-                metadata["created_at"] = created_at.isoformat()
-            if source_sha256 is not None:
-                metadata["source_sha256"] = source_sha256
-            request: PutObjectRequestTypeDef = {
-                "Bucket": self._bucket,
-                "Key": key,
-                "Body": image.data,
-                "ContentType": image.media_type,
-                "CacheControl": cache_control,
-                "ContentDisposition": "inline",
-                "Metadata": metadata,
-            }
-            if if_absent:
-                request["IfNoneMatch"] = "*"
-            try:
-                self._client.put_object(**request)
-            except ClientError as exc:
-                if if_absent and _http_status(exc) == 412:
-                    return False
-                raise
-            return True
-
-        return self._invoke(_put)
 
     def discard_image(
         self, account: Account, image_id: UUID, extension: ImageExtension
     ) -> None:
-        """Delete an exact key written by this process."""
-        key = object_key(account, image_id, extension)
-
-        def _delete() -> None:
-            self._client.delete_object(Bucket=self._bucket, Key=key)
-
-        self._invoke(_delete)
+        self._objects.delete(object_key(account, image_id, extension))
 
     def delete_image(self, account: Account, image_id: UUID) -> None:
-        """Delete one stored image, or raise when it is not in the account."""
         self.get_image(account, image_id)
         for extension in ("avif", "webp"):
-            key = object_key(account, image_id, extension, variant=True)
-
-            def _delete_variant(object_key: str = key) -> None:
-                self._client.delete_object(Bucket=self._bucket, Key=object_key)
-
-            self._invoke(_delete_variant)
+            self._objects.delete(object_key(account, image_id, extension, variant=True))
         for extension in _EXTENSIONS:
             self.discard_image(account, image_id, extension)
 
@@ -245,31 +181,21 @@ class S3ImageStore:
         *,
         variant: bool = False,
     ) -> ImageObject:
-        """Read one exact canonical, legacy, or versioned delivery object."""
-        key = object_key(account, image_id, extension, variant=variant)
-        response = self._invoke(
-            lambda: self._client.head_object(Bucket=self._bucket, Key=key),
-            missing_ok=True,
+        stored = self._objects.head(
+            object_key(account, image_id, extension, variant=variant)
         )
-        return replace(
-            _object_from_head(image_id, extension, response), variant=variant
-        )
+        return replace(_object_from_head(image_id, extension, stored), variant=variant)
 
     def read_image(self, account: Account, image: ImageObject) -> bytes:
-        """Read a bounded source object without fetching a capability URL."""
         if image.byte_size > MAX_STORED_BYTES:
             raise StorageInvalid()
-        key = object_key(account, image.id, image.extension, variant=image.variant)
-
-        def _read() -> bytes:
-            response = self._client.get_object(Bucket=self._bucket, Key=key)
-            with response["Body"] as body:
-                payload = body.read(MAX_STORED_BYTES + 1)
-            if len(payload) != image.byte_size or len(payload) > MAX_STORED_BYTES:
-                raise StorageInvalid()
-            return payload
-
-        return self._invoke(_read, missing_ok=True)
+        value = self._objects.read(
+            object_key(account, image.id, image.extension, variant=image.variant),
+            MAX_STORED_BYTES,
+        )
+        if len(value) != image.byte_size:
+            raise StorageInvalid()
+        return value
 
     def list_images(self, account: Account, *, limit: int) -> list[ImageObject]:
         """Return up to `limit` images for an account, oldest first.
@@ -305,26 +231,19 @@ class S3ImageStore:
         return len(counted)
 
     def _iter_images(self, account: Account) -> Iterator[ImageObject]:
-        token: str | None = None
-        prefix = account_prefix(account)
+        cursor: str | None = None
         for _ in range(_MAX_LIST_PAGES):
-            page = self._list_page(prefix, _LIST_PAGE_SIZE, token)
-            contents = page.get("Contents")
-            if contents is not None:
-                for item in contents:
-                    image = _object_from_listing(account, item)
-                    if image is not None:
-                        yield image
-            if not page.get("IsTruncated", False):
+            page = self._objects.list(account_prefix(account), _LIST_PAGE_SIZE, cursor)
+            for item in page.objects:
+                image = _object_from_listing(account, item)
+                if image is not None:
+                    yield image
+            if page.cursor is None:
                 return
-            next_token = page.get("NextContinuationToken")
-            if (
-                not isinstance(next_token, str)
-                or next_token == ""
-                or next_token == token
-            ):
-                return
-            token = next_token
+            if page.cursor == cursor:
+                raise StorageInvalid()
+            cursor = page.cursor
+        raise StorageUnavailable()
 
     def url_for(
         self,
@@ -334,55 +253,139 @@ class S3ImageStore:
         *,
         variant: bool = False,
     ) -> str:
-        """Return the URL a client uses to fetch the object."""
         key = object_key(account, image_id, extension, variant=variant)
         if self._public_base_url is not None:
             return f"{self._public_base_url}/{quote(key, safe='/')}"
+        return self._objects.signed_url(key, self._presign_seconds)
 
-        def _presign() -> str:
-            return self._client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": self._bucket, "Key": key},
-                ExpiresIn=self._presign_seconds,
-            )
 
-        return self._invoke(_presign)
+class S3ObjectStorage:
+    """The portable S3 transport; the Worker uses a binding instead."""
 
-    def _list_page(
-        self, prefix: str, max_keys: int, token: str | None
-    ) -> ListObjectsV2OutputTypeDef:
-        if token is None:
+    def __init__(self, client: S3Client, bucket: str) -> None:
+        self._client = client
+        self._bucket = bucket
 
-            def _list_first() -> ListObjectsV2OutputTypeDef:
+    def close(self) -> None:
+        self._client.close()
+
+    def head(self, key: str) -> StoredObject:
+        result = self._invoke(
+            lambda: self._client.head_object(Bucket=self._bucket, Key=key)
+        )
+        return StoredObject(
+            key, result["ContentLength"], result["LastModified"], result["Metadata"]
+        )
+
+    def read(self, key: str, maximum: int) -> bytes:
+        def read() -> bytes:
+            result = self._client.get_object(Bucket=self._bucket, Key=key)
+            with result["Body"] as body:
+                value = body.read(maximum + 1)
+            if len(value) > maximum:
+                raise StorageInvalid()
+            return value
+
+        return self._invoke(read)
+
+    def put(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        media_type: str,
+        cache_control: str,
+        metadata: dict[str, str],
+        if_absent: bool = False,
+    ) -> bool:
+        from botocore.exceptions import ClientError
+
+        def put() -> bool:
+            parameters: PutObjectRequestTypeDef = {
+                "Bucket": self._bucket,
+                "Key": key,
+                "Body": payload,
+                "ContentType": media_type,
+                "CacheControl": cache_control,
+                "ContentDisposition": "inline",
+                "Metadata": metadata,
+            }
+            if if_absent:
+                parameters["IfNoneMatch"] = "*"
+            try:
+                self._client.put_object(**parameters)
+            except ClientError as error:
+                if if_absent and _http_status(error) in {409, 412}:
+                    return False
+                raise
+            return True
+
+        return self._invoke(put)
+
+    def delete(self, key: str) -> None:
+        self._invoke(lambda: self._client.delete_object(Bucket=self._bucket, Key=key))
+
+    def list(self, prefix: str, limit: int, cursor: str | None) -> ObjectPage:
+        def listing() -> ListObjectsV2OutputTypeDef:
+            if cursor is None:
                 return self._client.list_objects_v2(
-                    Bucket=self._bucket,
-                    Prefix=prefix,
-                    MaxKeys=max_keys,
+                    Bucket=self._bucket, Prefix=prefix, MaxKeys=limit
                 )
-
-            return self._invoke(_list_first)
-
-        def _list_next(continuation: str = token) -> ListObjectsV2OutputTypeDef:
             return self._client.list_objects_v2(
                 Bucket=self._bucket,
                 Prefix=prefix,
-                MaxKeys=max_keys,
-                ContinuationToken=continuation,
+                MaxKeys=limit,
+                ContinuationToken=cursor,
             )
 
-        return self._invoke(_list_next)
+        result = self._invoke(listing)
+        objects = [
+            StoredObject(item["Key"], item["Size"], item["LastModified"])
+            for item in result.get("Contents", [])
+            if "Key" in item and "Size" in item and "LastModified" in item
+        ]
+        next_cursor = (
+            result.get("NextContinuationToken") if result.get("IsTruncated") else None
+        )
+        if result.get("IsTruncated") and not next_cursor:
+            raise StorageInvalid()
+        return ObjectPage(objects, next_cursor)
 
-    def _invoke(self, func: Callable[[], _T], *, missing_ok: bool = False) -> _T:
+    def signed_url(self, key: str, seconds: int) -> str:
+        return self._invoke(
+            lambda: self._client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self._bucket, "Key": key},
+                ExpiresIn=seconds,
+            )
+        )
+
+    def _invoke(self, operation: Callable[[], _T]) -> _T:
+        from botocore.exceptions import BotoCoreError, ClientError
+
         try:
-            return func()
-        except ClientError as exc:
-            if missing_ok and _missing(exc):
+            return operation()
+        except ClientError as error:
+            if _missing(error):
                 raise ImageNotFound() from None
-            _log_client_error(exc)
+            _log_client_error(error)
             raise StorageUnavailable() from None
-        except BotoCoreError as exc:
-            logger.warning("object storage request failed (%s)", type(exc).__name__)
+        except BotoCoreError as error:
+            logger.warning("object storage request failed (%s)", type(error).__name__)
             raise StorageUnavailable() from None
+
+
+class S3ImageStore(ImageStore):
+    def __init__(
+        self,
+        client: S3Client,
+        bucket: str,
+        public_base_url: str | None,
+        presign_seconds: int,
+    ) -> None:
+        super().__init__(
+            S3ObjectStorage(client, bucket), public_base_url, presign_seconds
+        )
 
 
 def build_image_store(settings: Settings) -> S3ImageStore | None:
@@ -400,6 +403,9 @@ def build_image_store(settings: Settings) -> S3ImageStore | None:
         or secret_key is None
     ):
         return None
+    import boto3
+    from botocore.config import Config
+
     public = settings.storage_public_base_url
     session = boto3.session.Session(
         aws_access_key_id=access_key,
@@ -459,14 +465,11 @@ def _secret_text(value: SecretStr | None) -> str | None:
 def _object_from_head(
     image_id: UUID,
     extension: ImageExtension,
-    response: HeadObjectOutputTypeDef,
+    response: StoredObject,
 ) -> ImageObject:
-    try:
-        byte_size = response["ContentLength"]
-        modified = response["LastModified"]
-        metadata = response["Metadata"]
-    except KeyError:
-        raise StorageInvalid() from None
+    byte_size = response.size
+    modified = response.modified
+    metadata = response.metadata
     if byte_size < 1:
         raise StorageInvalid()
     created_at = _aware(modified)
@@ -494,10 +497,10 @@ def _object_from_head(
     )
 
 
-def _object_from_listing(account: Account, item: ObjectTypeDef) -> ImageObject | None:
-    key = item.get("Key")
-    size = item.get("Size")
-    modified = item.get("LastModified")
+def _object_from_listing(account: Account, item: StoredObject) -> ImageObject | None:
+    key = item.key
+    size = item.size
+    modified = item.modified
     if key is None or size is None or size < 1 or modified is None:
         return None
     parsed = _parse_object_key(key, account)
@@ -534,12 +537,13 @@ def _parse_object_key(key: str, account: Account) -> tuple[UUID, ImageExtension]
     return None
 
 
-def _dimension(metadata: dict[str, str], name: str) -> int:
+def _dimension(metadata: Mapping[str, str], name: str) -> int:
     raw = metadata.get(name)
     if raw is None or not raw.isdigit():
         raise StorageInvalid()
     value = int(raw)
-    if value < 1 or value > MAX_DECODE_EDGE:
+    # Stored metadata also describes images written before today's decode caps.
+    if value < 1 or value > 65535:
         raise StorageInvalid()
     return value
 

@@ -10,7 +10,6 @@ import imagecodecs
 import numpy as np
 from PIL import (
     Image,
-    ImageCms,
     ImageFile,
     ImageOps,
     PngImagePlugin,
@@ -47,10 +46,15 @@ _PNG_TEXT_CHUNK_BYTES = 1024 * 1024
 _PNG_TEXT_MEMORY_BYTES = 8 * 1024 * 1024
 _SHRINK_STEPS = 8
 
-Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS
+# JPEG headers describe the original dimensions before draft decoding reduces
+# them by up to 8 per edge. Actual decode bounds are checked before load().
+Image.MAX_IMAGE_PIXELS = MAX_DECODE_PIXELS * 64
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 PngImagePlugin.MAX_TEXT_CHUNK = _PNG_TEXT_CHUNK_BYTES
 PngImagePlugin.MAX_TEXT_MEMORY = _PNG_TEXT_MEMORY_BYTES
+Image.init()
+if not imagecodecs.JPEGXL.available or not imagecodecs.CMS.available:
+    raise RuntimeError("JPEG XL and ICC color conversion codecs are required")
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,12 +66,13 @@ class ImagePipeline:
     max_decode_edge: int = MAX_DECODE_EDGE
     max_decode_pixels: int = MAX_DECODE_PIXELS
     avif_quality: int = 80
-    avif_speed: int = 6
+    avif_speed: int = 10
     avif_threads: int = 1
     jxl_distance: float = 1.0
-    jxl_effort: int = 5
-    lossless: bool = False
-    max_output_edge: int | None = None
+    jxl_effort: int = 1
+    # Modular lossless JPEG XL avoids the lossy encoder's larger working set.
+    lossless: bool = True
+    max_output_edge: int | None = 512
     output_format: DeliveryFormat = "jxl"
 
 
@@ -92,7 +97,6 @@ def process_image(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
         ValueError,
         EOFError,
         RuntimeError,
-        ImageCms.PyCMSError,
     ):
         raise ImageInvalid() from None
 
@@ -132,6 +136,11 @@ def delivery_variant(
         ):
             raise ImageInvalid()
         with Image.fromarray(pixels) as image:
+            if pipeline.max_output_edge is not None:
+                image.thumbnail(
+                    (pipeline.max_output_edge, pipeline.max_output_edge),
+                    Image.Resampling.LANCZOS,
+                )
             data, media_type, extension, width, height = _encode_within_budget(
                 image, "JXL", pipeline
             )
@@ -170,14 +179,20 @@ def _process(payload: bytes, pipeline: ImagePipeline) -> ProcessedImage:
                         expanded = _display_image(working)
                         working.close()
                         working = expanded
-                    converted = ImageCms.profileToProfile(
-                        working,
-                        ImageCms.ImageCmsProfile(BytesIO(profile)),
-                        ImageCms.createProfile("sRGB"),
-                        outputMode="RGBA" if working.has_transparency_data else "RGB",
+                    pixels = imagecodecs.cms_transform(
+                        np.asarray(working),
+                        profile,
+                        imagecodecs.cms_profile("srgb"),
+                        colorspace={"L": "GRAY", "LA": "GRAYA"}.get(
+                            working.mode, working.mode
+                        ),
+                        outcolorspace="RGBA"
+                        if working.has_transparency_data
+                        else "RGB",
+                        intent=0,
+                        flags=imagecodecs.CMS.FLAGS.COPY_ALPHA,
                     )
-                    if converted is None:
-                        raise ImageInvalid()
+                    converted = Image.fromarray(pixels)
                     if working is not opened:
                         working.close()
                     working = converted
@@ -238,14 +253,14 @@ def _exceeds_decode_budget(width: int, height: int, pipeline: ImagePipeline) -> 
 
 
 def _draft_box(width: int, height: int, pipeline: ImagePipeline) -> tuple[int, int]:
-    scale = 1.0
-    longest = max(width, height)
-    if longest > pipeline.max_decode_edge:
-        scale = min(scale, pipeline.max_decode_edge / longest)
-    pixels = width * height
-    if pixels > pipeline.max_decode_pixels:
-        scale = min(scale, math.sqrt(pipeline.max_decode_pixels / pixels))
-    return (max(1, int(width * scale)), max(1, int(height * scale)))
+    # libjpeg rounds draft sizes to power-of-two reductions. Choose a decoder
+    # size that fits the budget before allocating its bitmap.
+    for divisor in (1, 2, 4, 8):
+        if not _exceeds_decode_budget(
+            math.ceil(width / divisor), math.ceil(height / divisor), pipeline
+        ):
+            return max(1, width // divisor), max(1, height // divisor)
+    raise ImageDimensions()
 
 
 def _reject_animation(image: Image.Image) -> None:
@@ -389,6 +404,13 @@ def _encode(
     return _nonempty(bytes(data)), "image/jxl", "jxl"
 
 
+def initialize_processing() -> None:
+    """Initialize codec tables before serving requests on snapshot-based hosts."""
+    with Image.new("RGB", (1, 1)) as image:
+        _encode(image, "PNG", ImagePipeline())
+        _encode(image, "", ImagePipeline(output_format="webp"))
+
+
 def _format(format: DeliveryFormat) -> tuple[ImageMediaType, ImageExtension]:
     if format == "webp":
         return "image/webp", "webp"
@@ -399,11 +421,13 @@ def _format(format: DeliveryFormat) -> tuple[ImageMediaType, ImageExtension]:
 
 def _encode_portrait_webp(image: Image.Image) -> bytes:
     buffer = BytesIO()
-    image.save(buffer, format="WEBP", quality=85, method=6)
+    image.save(buffer, format="WEBP", quality=85, method=0)
     return _nonempty(buffer.getvalue())
 
 
 def _encode_avif(image: Image.Image, pipeline: ImagePipeline) -> bytes:
+    if "AVIF" not in Image.SAVE:
+        raise ImageUnsupported("AVIF delivery is unavailable. Choose WebP or JPEG XL.")
     buffer = BytesIO()
     image.save(
         buffer,

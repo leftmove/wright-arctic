@@ -33,7 +33,7 @@ from app.services.images.processing import (
     delivery_variant,
     process_image,
 )
-from app.services.images.storage import S3ImageStore, build_image_store
+from app.services.images.storage import ImageStore, build_image_store
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ class ImageService:
     """Compress uploads and keep them in object storage."""
 
     def __init__(
-        self, store: S3ImageStore, pipeline: ImagePipeline | None = None
+        self, store: ImageStore, pipeline: ImagePipeline | None = None
     ) -> None:
         # Load the native codec at startup so deployment health checks catch
         # incompatible/missing wheels before publishing any delivery URLs.
@@ -57,6 +57,10 @@ class ImageService:
     def close(self) -> None:
         """Release the storage client."""
         self._store.close()
+
+    def open(self) -> None:
+        """Verify object storage access."""
+        self._store.open()
 
     def portrait(
         self, account: Account, *, format: DeliveryFormat = "webp"
@@ -116,7 +120,12 @@ class ImageService:
                     pass
             raise ImageQuotaExceeded(limit)
         pipeline = (
-            replace(self._pipeline, max_output_edge=512) if portrait else self._pipeline
+            replace(
+                self._pipeline,
+                max_output_edge=min(512, self._pipeline.max_output_edge or 512),
+            )
+            if portrait
+            else self._pipeline
         )
         processed = process_image(payload, pipeline)
         created_at = datetime.now(UTC)
@@ -304,7 +313,7 @@ def _read_limited(source: BinaryIO, known_size: int | None, limit: int) -> bytes
     return payload
 
 
-def _summary(account: Account, image: ImageObject, store: S3ImageStore) -> ImageSummary:
+def _summary(account: Account, image: ImageObject, store: ImageStore) -> ImageSummary:
     return ImageSummary(
         id=image.id,
         media_type=image.media_type,

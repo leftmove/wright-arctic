@@ -11,182 +11,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  current:
-    name: Keep the latest main commit
+  deploy:
+    name: Build and deploy the Python Worker
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    outputs:
-      deploy: ${{ steps.gate.outputs.deploy }}
-      sha: ${{ steps.gate.outputs.sha }}
-    steps:
-      - name: Skip a superseded commit
-        id: gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-          sha="${{ github.sha }}"
-          latest="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
-          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
-          if [ "$sha" = "$latest" ]; then
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "deploy=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping ${sha}; main is ${latest}."
-          fi
-
-  deploy:
-    name: Build the engine wheel and deploy
-    needs: current
-    if: needs.current.outputs.deploy == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.current.outputs.sha }}
           persist-credentials: false
-
-      - name: Build the Linux engine wheel
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+      - name: Read the pinned native codec
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          command: build
-          target: x86_64
-          manylinux: "2_28"
-          rust-toolchain: "1.99.1"
-          maturin-version: "v1.15.0"
-          working-directory: engine
-          args: --release --locked --interpreter python3.14 --out dist
-
-      - name: Keep the CPython 3.14 manylinux wheel
-        id: wheel
-        run: |
-          set -eu
-          sudo chown -R "$(id -u):$(id -g)" engine
-          mkdir -p dist/vercel
-          found=0
-          wheel=""
-          for candidate in engine/dist/*.whl dist/*.whl; do
-            [ -f "$candidate" ] || continue
-            base="$(basename "$candidate")"
-            case "$base" in
-              *cp314-cp314-manylinux_2_28_x86_64*)
-                wheel="$candidate"
-                found=$((found + 1))
-                ;;
-            esac
-          done
-          if [ "$found" -ne 1 ]; then
-            echo "Expected one CPython 3.14 manylinux_2_28 x86_64 wheel, found ${found}."
-            find engine dist -name '*.whl' -print || true
-            exit 1
-          fi
-          destination="dist/vercel/$(basename "$wheel")"
-          mv "$wheel" "$destination"
-          echo "path=${destination}" >> "$GITHUB_OUTPUT"
-
+          repository: leftmove/wright-pacific
+          ref: 1cfa2f501e8f9a57865152ce869da93c74024b9b
+          token: ${{ secrets.WRIGHT_NATIVE_READ_TOKEN }}
+          path: .native-codec
+          persist-credentials: false
+      - name: Use the verified codec checkout for Cargo
+        run: git config --global url."file://${GITHUB_WORKSPACE}/.native-codec".insteadOf https://github.com/leftmove/wright-pacific.git
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
-          version: "0.13.1"
+          version: "0.13.4"
           enable-cache: true
-
-      - name: Install the engine from the wheel
+      - name: Install the pinned Rust toolchain
+        working-directory: engine
+        run: rustup show
+      - name: Install locked development dependencies
+        run: uv sync --locked
+      - name: Prepare the WebAssembly toolchain
+        run: make worker-setup
+      - name: Build the PyEmscripten wheel and Worker bundle
+        run: make worker-build
+      - name: Check that this is still the latest main commit
         env:
-          ENGINE_WHEEL: ${{ steps.wheel.outputs.path }}
-        run: |
-          set -eu
-          python3 - "$ENGINE_WHEEL" <<'PY'
-          import sys
-          from pathlib import Path
-
-          wheel = sys.argv[1]
-          path = Path("pyproject.toml")
-          text = path.read_text()
-          workspace = '[tool.uv.workspace]\nmembers = ["engine"]\n\n'
-          source = "wright-arctic-engine = { workspace = true }"
-          version_pin = 'required-version = ">=0.13.1"\n'
-          if workspace not in text or source not in text or version_pin not in text:
-              raise SystemExit("pyproject.toml no longer has the expected engine source")
-          text = text.replace(workspace, "", 1)
-          text = text.replace(
-              source,
-              f'wright-arctic-engine = {{ path = "{wheel}" }}',
-              1,
-          )
-          text = text.replace(
-              version_pin,
-              version_pin
-              + 'environments = ["sys_platform == \'linux\' and platform_machine == \'x86_64\'"]\n',
-              1,
-          )
-          path.write_text(text)
-          PY
-          uv lock
-          rm -rf engine
-
-      - name: Install the Vercel CLI
-        run: npm install --prefix "$RUNNER_TEMP/vercel-cli" vercel@64.7.0
-
-      - name: Pull the production project settings
-        run: |
-          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" pull --yes --environment=production
-
-      - name: Build the FastAPI function
+          GH_TOKEN: ${{ github.token }}
+        run: test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)" = "$GITHUB_SHA"
+      - name: Deploy the validated bundle
         env:
-          VERCEL_PYTHON_DISABLE_RUNTIME_INSTALL: "1"
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: make worker-deploy
+      - name: Verify the deployed runtime and bindings
         run: |
-          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" build --prod
-
-      - name: Stage and verify the prebuilt production function
-        id: staged
-        run: |
-          set -eu
-          deployment="$("$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" deploy --prebuilt --prod --skip-domain)"
-          "$RUNNER_TEMP/vercel-cli/node_modules/.bin/vercel" curl /health --deployment "$deployment" -- --fail --silent --show-error --max-time 60 --retry 2 --retry-all-errors
-          echo "deployment=${deployment}" >> "$GITHUB_OUTPUT"
-
-      - name: Promote the verified function
-        env:
-          DEPLOYMENT: ${{ steps.staged.outputs.deployment }}
-        run: |
-          # Use the project API: the CI token has deployment permissions but
-          # no user identity for the interactive promote command's lookup.
-          node --input-type=module <<'JS'
-          import { execFileSync } from 'node:child_process';
-
-          const cli = `${process.env.RUNNER_TEMP}/vercel-cli/node_modules/.bin/vercel`;
-          const team = process.env.VERCEL_ORG_ID;
-          const project = process.env.VERCEL_PROJECT_ID;
-          function api(path, method = 'GET') {
-            const args = ['api', `${path}?teamId=${team}`, '--method', method, '--raw'];
-            if (method === 'POST') args.push('--input', '-');
-            return execFileSync(cli, args, {
-              encoding: 'utf8', input: method === 'POST' ? '{}' : undefined,
-              stdio: ['pipe', 'pipe', 'inherit'],
-            });
-          }
-          const host = new URL(process.env.DEPLOYMENT).hostname;
-          const deployment = JSON.parse(api(`/v13/deployments/${host}`));
-          if (deployment.projectId !== project || deployment.target !== 'production' ||
-              !/^dpl_[A-Za-z0-9]+$/.test(deployment.id)) {
-            throw new Error('Refusing to promote a deployment outside this production project');
-          }
-          api(`/v10/projects/${project}/promote/${deployment.id}`, 'POST');
-          // Project state reports the actual production target even when
-          // Vercel does not expose a lastAliasRequest for the promotion.
-          const deadline = Date.now() + 180_000;
-          let productionId;
-          while (Date.now() < deadline) {
-            productionId = JSON.parse(api(`/v9/projects/${project}`)).targets?.production?.id;
-            if (productionId === deployment.id) {
-              console.log('Production promotion verified.');
-              process.exit(0);
-            }
-            await new Promise(resolve => setTimeout(resolve, 3000));
-          }
-          throw new Error(`Production promotion timed out: expected ${deployment.id}, observed ${productionId ?? 'no production target'}`);
-          JS
+          curl --fail --silent --show-error --retry 3 --retry-all-errors --max-time 30 https://wright-arctic.anonyo.workers.dev/health
+          curl --fail --silent --show-error --retry 3 --retry-all-errors --max-time 30 https://wright-arctic.anonyo.workers.dev/hello
+          curl --fail --silent --show-error --retry 3 --retry-all-errors --max-time 30 https://wright-arctic.anonyo.workers.dev/ready

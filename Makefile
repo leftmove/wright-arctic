@@ -1,8 +1,9 @@
 UV ?= uv
 BUN ?= bun
+WORKER_UV ?= $(UV) tool run --from uv==0.13.4 uv
 
 .DEFAULT_GOAL := help
-.PHONY: help sync dev run stubs check-stubs check test format build
+.PHONY: help sync dev run stubs check-stubs check test format build worker-setup worker-build worker-dev worker-deploy
 
 help:
 	@printf '%s\n' \
@@ -15,6 +16,11 @@ help:
 	  'make test         Run backend security regression tests' \
 	  'make format       Format Python and Rust' \
 	  'make build        Build the engine source distribution and wheel'
+	@printf '%s\n' \
+	  'make worker-setup Prepare the local WebAssembly build tools' \
+	  'make worker-build Build native wheels and validate the Worker bundle' \
+	  'make worker-dev   Serve the built Worker locally' \
+	  'make worker-deploy Deploy the validated Worker and runtime secrets'
 
 sync:
 	$(UV) sync --locked
@@ -60,3 +66,15 @@ format:
 
 build: stubs
 	$(UV) build --package wright-arctic-engine --no-sources
+
+worker-setup:
+	$(WORKER_UV) run python -m app.deployment setup
+
+worker-build:
+	$(WORKER_UV) run python -m app.deployment build
+
+worker-dev:
+	$(WORKER_UV) run python -m app.deployment dev
+
+worker-deploy:
+	$(WORKER_UV) run python -m app.deployment deploy

@@ -1,0 +1,122 @@
+lock-version = "1.0"
+created-by = "uv"
+requires-python = ">=3.14.2"
+
+[[packages]]
+name = "annotated-doc"
+version = "0.0.5"
+wheels = [{ url = "https://files.pythonhosted.org/packages/3e/30/e900b21425a860e195f32e37657aa1f7c7f2b1bfb26f03ca209b90933c06/annotated_doc-0.0.5-py3-none-any.whl", upload-time = 2026-07-28T13:50:57Z, size = 5302, hashes = { sha256 = "117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101" } }]
+
+[[packages]]
+name = "annotated-types"
+version = "0.8.0"
+wheels = [{ url = "https://files.pythonhosted.org/packages/99/91/8acff4f5e50511b911bbccb72b8628a49c68ce14148cd9f6431094859a90/annotated_types-0.8.0-py3-none-any.whl", upload-time = 2026-07-23T20:16:12Z, size = 13427, hashes = { sha256 = "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0" } }]
+
+[[packages]]
+name = "anyio"
+version = "4.16.0"
+wheels = [{ url = "https://files.pythonhosted.org/packages/a9/16/7757fb84c819accc7d7e9af5291b261e4abb8627ee040f99e7d35ef2457a/anyio-4.16.0-py3-none-any.whl", upload-time = 2026-11-01T11:20:05Z, size = 134521, hashes = { sha256 = "c66ae634e0b8228396b801741beb3294326d4b6102f7bba4041c0dfb58c29026" } }]
+
+[[packages]]
+name = "asyncpg"
+version = "0.31.0"
+wheels = [{ url = "https://cdn.jsdelivr.net/pyodide/v314.0.7/full/asyncpg-0.31.0-cp314-cp314-pyemscripten_2026_0_wasm32.whl", hashes = { sha256 = "32b4a4ea601ac68af6e8b78de2252e4bcf6c17101607556f63d034c642e8455b" } }]
+
+[[packages]]
+name = "fastapi"
+version = "0.162.2"
+wheels = [{ url = "https://files.pythonhosted.org/packages/d6/fb/0dc0f819163bc6b7f9e6802d7d0b1ac180fbbe4e75dbd10655c6a4d77796/fastapi-0.162.2-py3-none-any.whl", upload-time = 2026-11-07T15:41:38Z, size = 151671, hashes = { sha256 = "d0584f9662317e01140df94c64f4bed1d8b059fe35496e30c9c92f70e6e5ff15" } }]
+
+[[packages]]
+name = "httpx"
+version = "0.28.1"
+wheels = [
+    { url = "https://cdn.jsdelivr.net/pyodide/v314.0.7/full/httpx-0.28.1-py3-none-any.whl", hashes = { sha256 = "830cb1ec73bb4c46f2e38ebeb3dd50ffb45f62b804dd040519d34fe36f8fdfc7" } },
+    { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hashes = { sha256 = "d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad" } },
+]
+
+[[packages]]
+name = "idna"
+version = "3.20"
+wheels = [{ url = "https://files.pythonhosted.org/packages/58/a2/bb081bab032533a855d44de1d56f8e8426114ff1ba5d1f07a438a0a654f8/idna-3.20-py3-none-any.whl", upload-time = 2026-09-17T14:11:03Z, size = 69583, hashes = { sha256 = "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c" } }]
+
+[[packages]]
+name = "imagecodecs"
+version = "2026.10.10"
+wheels = [{ url = "https://files.pythonhosted.org/packages/00/dd/9641540f5d34ad10aef4f44a6b4b919ef055e366a98c41e2b8f5decb6d6d/imagecodecs-2026.10.10-cp312-abi3-pyemscripten_2026_0_wasm32.whl", upload-time = 2026-10-09T22:44:25Z, size = 4068999, hashes = { sha256 = "e9518d868cd862d17c9cb721435054c54671e30a01d385a8e263d07c2bbb83b8" } }]
+
+[[packages]]
+name = "numpy"
+version = "2.4.6"
+wheels = [{ url = "https://cdn.jsdelivr.net/pyodide/v314.0.7/full/numpy-2.4.6-cp314-cp314-pyemscripten_2026_0_wasm32.whl", hashes = { sha256 = "a292c1f5d7d8a2208cd5e94fc467604c131cabcd2fc14fed6eefde121e7fabdf" } }]
+
+[[packages]]
+name = "opentelemetry-api"
+version = "1.45.2"
+wheels = [{ url = "https://files.pythonhosted.org/packages/a9/2d/610db864d7513158cebb8f36cc88e67e73bd6c7aa1905ef18d89e1281c81/opentelemetry_api-1.45.2-py3-none-any.whl", upload-time = 2026-10-29T17:29:06Z, size = 60335, hashes = { sha256 = "2cbd737377e710ee740d261c94e93fa0f08e6d037c18f17513cc0a2d94479a34" } }]
+
+[[packages]]
+name = "pillow"
+version = "12.2.0"
+wheels = [{ url = "https://cdn.jsdelivr.net/pyodide/v314.0.7/full/pillow-12.2.0-cp314-cp314-pyemscripten_2026_0_wasm32.whl", hashes = { sha256 = "e29838b7a756e4ee0f27a9cfa9a387ee0dfa2e9dd44be2dd595130b9f9d93ac3" } }]
+
+[[packages]]
+name = "pydantic"
+version = "2.14.3"
+wheels = [{ url = "https://files.pythonhosted.org/packages/72/b8/b864503789ef5c58597d2a7b4adbee62c26440ab1e682581fc6838df8947/pydantic-2.14.3-py3-none-any.whl", upload-time = 2026-11-05T09:17:02Z, size = 494071, hashes = { sha256 = "3f7b347782ab7e4cf4c798496ae3a82787d9f21ec12676a9c564355eeef8daa8" } }]
+
+[[packages]]
+name = "pydantic-core"
+version = "2.50.4"
+wheels = [{ url = "https://files.pythonhosted.org/packages/c6/07/a7d8615b8677bf69e24666bbce431299850c95a7b084649342582a1c3210/pydantic_core-2.50.4-cp314-cp314-pyemscripten_2026_0_wasm32.whl", upload-time = 2026-11-05T09:13:15Z, size = 1496509, hashes = { sha256 = "e6da138a1ecc1341c8b788a5ee822670b03788e1f5decf7af9d461de6e508b8e" } }]
+
+[[packages]]
+name = "pydantic-settings"
+version = "2.16.2"
+wheels = [{ url = "https://files.pythonhosted.org/packages/39/88/4131c51ff87b7cd7f82a1194d0c0a2b7ca68c72d9da04c3b7e69ab91a79f/pydantic_settings-2.16.2-py3-none-any.whl", upload-time = 2026-10-28T11:14:26Z, size = 81994, hashes = { sha256 = "8d523e5c129b097686bde019bd6109bff53f4c8c3f63f1ddf9933ffa42e5ab4f" } }]
+
+[[packages]]
+name = "pyjwt"
+version = "2.15.1"
+wheels = [{ url = "https://files.pythonhosted.org/packages/50/ca/44de4e75f8aadc457f0634be3b542815078ded46dca30efb960edeecad6e/pyjwt-2.15.1-py3-none-any.whl", upload-time = 2026-09-28T18:40:41Z, size = 33860, hashes = { sha256 = "42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193" } }]
+
+[[packages]]
+name = "python-dotenv"
+version = "1.2.4"
+wheels = [{ url = "https://files.pythonhosted.org/packages/60/d1/38f3a3405989a89ac18390803e70c6ad7c7760da4f9b83cbeca0c44a0c72/python_dotenv-1.2.4-py3-none-any.whl", upload-time = 2026-10-01T05:36:08Z, size = 23266, hashes = { sha256 = "42269a8a5b3fd54ffa6f3d84b18abed50064717576b4ecf03dc4a55d8aa04fdc" } }]
+
+[[packages]]
+name = "python-multipart"
+version = "0.0.33"
+wheels = [{ url = "https://files.pythonhosted.org/packages/dd/1b/6b1b4164ec734cac911460ab599bfbe46afedd42c5c9627fe4235942c314/python_multipart-0.0.33-py3-none-any.whl", upload-time = 2026-10-31T14:23:46Z, size = 32253, hashes = { sha256 = "8f16c07b36add9da6b2ee87d3efcaf0a45a6de9c3d0a5dd94e9ccf7675a7bc45" } }]
+
+[[packages]]
+name = "sqids"
+version = "0.5.2"
+wheels = [{ url = "https://files.pythonhosted.org/packages/7c/96/178018f3d5b871042e257e9e1db26c6aeb2a704e72cdc884cd2a8918ac2b/sqids-0.5.2-py3-none-any.whl", upload-time = 2025-05-13T16:36:34Z, size = 8870, hashes = { sha256 = "0089ba823e21fd44290c7225f02fb0b5140c36e41959c04d86d3f6f2513799be" } }]
+
+[[packages]]
+name = "starlette"
+version = "1.10.0"
+wheels = [{ url = "https://files.pythonhosted.org/packages/88/2e/947cfe02def9371c07cd5bf5b6b61c829e9aecb9904db02a66cfafbc1eec/starlette-1.10.0-py3-none-any.whl", upload-time = 2026-10-24T15:04:10Z, size = 80571, hashes = { sha256 = "478c0ab3b4ced6e82719849c118fa406f0278a3499c1a898cd15cd31bdc38ce4" } }]
+
+[[packages]]
+name = "typing-extensions"
+version = "4.16.0"
+wheels = [{ url = "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl", upload-time = 2026-07-02T08:40:04Z, size = 45571, hashes = { sha256 = "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8" } }]
+
+[[packages]]
+name = "typing-inspection"
+version = "0.4.5"
+wheels = [{ url = "https://files.pythonhosted.org/packages/de/0c/ea2544850a7c135e15033a5c7a8e7211136184b7ae63e2239d557c2b3019/typing_inspection-0.4.5-py3-none-any.whl", upload-time = 2026-11-04T14:13:22Z, size = 14874, hashes = { sha256 = "bc210535442b39e1bf2805e0c7a17dfd6a4ace760c84c7f7d16245d23a6b1c39" } }]
+
+[[packages]]
+name = "workers-runtime-sdk"
+version = "1.9.6"
+wheels = [{ url = "https://files.pythonhosted.org/packages/58/e4/fffa3f6b3eb91b34dcc06f0b9de016cb90c156ae2a2e944054b02618e981/workers_runtime_sdk-1.9.6-py3-none-any.whl", upload-time = 2026-11-04T07:04:34Z, size = 41483, hashes = { sha256 = "f343880a9c1380dd9b340808df93d584ff3c77428f932e14f4a23c36b7bd1bdc" } }]
+
+[[packages]]
+name = "wright-arctic-engine"
+version = "0.1.0"
+marker = "sys_platform == 'emscripten'"
+archive = { path = "wheels/wright_arctic_engine-0.1.0-cp314-cp314-pyemscripten_2026_0_wasm32.whl", hashes = { sha256 = "8729b613eb5e42c3da95727a0b96cb7234001c619fb21e49e60e0bef128cdf7b" } }

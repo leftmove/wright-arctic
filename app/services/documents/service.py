@@ -10,7 +10,6 @@ import re
 from typing import Literal
 from uuid import UUID, uuid7
 
-from psycopg.types.json import Jsonb
 from pydantic import JsonValue, TypeAdapter
 
 from app.accounts import Account
@@ -37,6 +36,7 @@ from app.services.documents.errors import (
 )
 from app.services.documents.models import Document, Native, Prefix
 from app.services.documents.slugs import encode_sharing_number
+from app.services.documents.values import JsonParameter
 
 _SELECT = """select d.*,s.owner_user_id,s.canonical_name,
  case when s.owner_user_id=%s then 'owner' else a.role end as role
@@ -44,17 +44,23 @@ _SELECT = """select d.*,s.owner_user_id,s.canonical_name,
  left join documents.access a on a.document_id=d.id and a.user_id=%s
  where d.id=%s and (s.owner_user_id=%s or a.user_id=%s)"""
 
+# Compile boundary validators once, rather than for every SQL value/history row.
+_NUMBER = TypeAdapter(int)
+_BYTES = TypeAdapter(bytes)
+_METADATA = TypeAdapter(dict[str, JsonValue])
+_UUID = TypeAdapter(UUID)
+
 
 def _number(row: Row, key: str) -> int:
-    return TypeAdapter(int).validate_python(row[key])
+    return _NUMBER.validate_python(row[key])
 
 
 def _bytes(row: Row, key: str) -> bytes:
-    return TypeAdapter(bytes).validate_python(row[key], strict=True)
+    return _BYTES.validate_python(row[key], strict=True)
 
 
 def _json(row: Row, key: str) -> dict[str, JsonValue]:
-    return TypeAdapter(dict[str, JsonValue]).validate_python(row[key])
+    return _METADATA.validate_python(row[key])
 
 
 def summary(document: Document) -> DocumentSummary:
@@ -215,7 +221,7 @@ class DocumentService:
                 doc.schema_name,
                 doc.schema_version,
                 payload,
-                Jsonb(metadata),
+                JsonParameter(metadata),
                 fingerprint,
             ),
         )
@@ -272,7 +278,7 @@ class DocumentService:
             )
             if not rows:
                 raise NotFound()
-            target = TypeAdapter(UUID).validate_python(rows[0]["document_id"])
+            target = _UUID.validate_python(rows[0]["document_id"])
             return summary(self._document(tx, self.actor(account), target))
 
     def _insert(
@@ -291,7 +297,7 @@ class DocumentService:
         )
         if not spaces:
             raise Unavailable()
-        space = TypeAdapter(UUID).validate_python(spaces[0]["id"])
+        space = _UUID.validate_python(spaces[0]["id"])
         title = (
             command.title
             if command.title_is_user_set
@@ -342,7 +348,9 @@ class DocumentService:
                 command.schema_name,
                 command.schema_version,
                 state,
-                Jsonb({"title": title, "title_is_user_set": command.title_is_user_set}),
+                JsonParameter(
+                    {"title": title, "title_is_user_set": command.title_is_user_set}
+                ),
                 fingerprint,
             ),
         )
@@ -392,7 +400,7 @@ class DocumentService:
                 (actor, command.operation_id),
             )
             if existing:
-                target = TypeAdapter(UUID).validate_python(existing[0]["document_id"])
+                target = _UUID.validate_python(existing[0]["document_id"])
                 doc = self._document(tx, actor, target, lock="update", owner=True)
                 receipt = self._receipt(tx, doc, command.operation_id, fingerprint)
                 assert receipt is not None
@@ -793,7 +801,7 @@ class DocumentService:
                 doc.schema_name,
                 doc.schema_version,
                 state,
-                Jsonb(metadata),
+                JsonParameter(metadata),
                 hashlib.sha256(state).digest(),
             ),
         )
@@ -807,7 +815,7 @@ class DocumentService:
         )
         if (
             doc.head_seq - _number(rows[0], "seq") >= 128
-            or replay_bytes >= 96 * 1024 * 1024
+            or replay_bytes >= 2 * 1024 * 1024
         ):
             self._checkpoint(
                 tx,

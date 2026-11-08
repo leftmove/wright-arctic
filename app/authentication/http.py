@@ -15,6 +15,7 @@ from app.authentication.errors import (
 from app.authentication.service import AuthenticationService
 from app.request_paths import route_path
 from app.schemas import error_body
+from app.state import scope_resources
 
 
 async def authenticate_request(
@@ -57,7 +58,11 @@ class AuthenticationMiddleware:
             await self._app(scope, receive, send)
             return
         try:
-            await authenticate_request(Request(scope), self._service)
+            resources = scope_resources(scope)
+            service = (
+                resources.authentication if resources is not None else self._service
+            )
+            await authenticate_request(Request(scope), service)
         except AuthenticationError as exc:
             await authentication_error_response(exc)(scope, receive, send)
             return
@@ -95,7 +100,9 @@ def install_authentication_error_handler(application: FastAPI) -> None:
     application.add_exception_handler(AuthenticationError, _handle_authentication_error)
 
 
-def _handle_authentication_error(_request: Request, exc: Exception) -> JSONResponse:
+async def _handle_authentication_error(
+    _request: Request, exc: Exception
+) -> JSONResponse:
     if not isinstance(exc, AuthenticationError):
         raise exc
     return authentication_error_response(exc)

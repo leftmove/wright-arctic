@@ -17,6 +17,10 @@ target
 .mypy_cache/
 .ruff_cache/
 .cache/
+.venv-workers/
+python_modules/
+.wrangler/
+.dev.vars*
 node_modules/
 .native-codec/
 
@@ -24,7 +28,6 @@ node_modules/
 .env*
 !.env.example
 .secrets/
-.vercel/
 
 # macOS
 .DS_Store

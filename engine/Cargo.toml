@@ -16,13 +16,18 @@ stubgen = ["dep:pyo3-stub-gen"]
 [dependencies]
 pyo3 = "0.29.3"
 pyo3-stub-gen = { version = "0.23.1", optional = true }
-wright-crdt = { git = "https://github.com/leftmove/wright-pacific.git", rev = "e7b66ef489af24e7c089d9cb13b8545b051abbc8" }
-wright-document = { git = "https://github.com/leftmove/wright-pacific.git", rev = "e7b66ef489af24e7c089d9cb13b8545b051abbc8" }
-wright-model = { git = "https://github.com/leftmove/wright-pacific.git", rev = "e7b66ef489af24e7c089d9cb13b8545b051abbc8" }
-wright-rich-text = { git = "https://github.com/leftmove/wright-pacific.git", rev = "e7b66ef489af24e7c089d9cb13b8545b051abbc8" }
-wright-state = { git = "https://github.com/leftmove/wright-pacific.git", rev = "e7b66ef489af24e7c089d9cb13b8545b051abbc8" }
+wright-crdt = { git = "https://github.com/leftmove/wright-pacific.git", rev = "1cfa2f501e8f9a57865152ce869da93c74024b9b" }
+wright-document = { git = "https://github.com/leftmove/wright-pacific.git", rev = "1cfa2f501e8f9a57865152ce869da93c74024b9b" }
+wright-model = { git = "https://github.com/leftmove/wright-pacific.git", rev = "1cfa2f501e8f9a57865152ce869da93c74024b9b" }
+wright-rich-text = { git = "https://github.com/leftmove/wright-pacific.git", rev = "1cfa2f501e8f9a57865152ce869da93c74024b9b" }
+wright-state = { git = "https://github.com/leftmove/wright-pacific.git", rev = "1cfa2f501e8f9a57865152ce869da93c74024b9b" }
 yrs = "=0.25.0"
 serde_json = "1"
+
+# PyO3's internal type registry must initialize without OS entropy when a
+# WebAssembly host snapshots module imports. Native builds keep std's hasher.
+[target.'cfg(target_os = "emscripten")'.dependencies]
+pyo3 = { version = "0.29.3", features = ["hashbrown"] }
 
 [[bin]]
 name = "generate_stubs"

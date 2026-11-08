@@ -8,16 +8,18 @@ import engine
 from app.services.documents.errors import Conflict, InvalidNative, TooLarge
 from app.services.documents.models import Native, SchemaName
 
-MAX_STATE = 64 * 1024 * 1024
-MAX_UPDATE = 4 * 1024 * 1024
-MAX_BATCH = 16 * 1024 * 1024
+MAX_STATE = 512 * 1024
+MAX_UPDATE = 128 * 1024
+MAX_BATCH = 256 * 1024
+
+_PROJECTION = TypeAdapter(JsonValue)
 
 
 def checked(result: engine.NativeDocument) -> Native:
     return Native(
         result.state,
         result.inferred_title,
-        TypeAdapter(JsonValue).validate_json(result.projection),
+        _PROJECTION.validate_json(result.projection),
         result.update,
     )
 

@@ -47,8 +47,8 @@ fn schema(name: &str) -> Result<Schema, String> {
 
 fn load(name: &str, updates: &[Vec<u8>]) -> Result<CrdtDocument, String> {
     if updates.is_empty()
-        || updates.len() > 16384
-        || updates.iter().map(Vec::len).sum::<usize>() > 128 * 1024 * 1024
+        || updates.len() > 1024
+        || updates.iter().map(Vec::len).sum::<usize>() > 8 * 1024 * 1024
     {
         return Err("native_state_too_large".into());
     }
@@ -62,7 +62,7 @@ fn load(name: &str, updates: &[Vec<u8>]) -> Result<CrdtDocument, String> {
 
 fn finish(doc: &CrdtDocument, update: Vec<u8>) -> Result<NativeDocument, String> {
     let state = doc.encode_state_as_update();
-    if state.len() > 64 * 1024 * 1024 {
+    if state.len() > 512 * 1024 {
         return Err("native_state_too_large".into());
     }
     Ok(NativeDocument {

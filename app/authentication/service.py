@@ -26,6 +26,7 @@ class AuthenticationService:
         self,
         settings: Settings,
         client: httpx.AsyncClient,
+        keys: SigningKeys | None = None,
     ) -> None:
         if settings.auth_issuer is None or settings.auth_jwks_url is None:
             raise ValueError("Authentication requires an issuer and a JWKS URL")
@@ -40,7 +41,11 @@ class AuthenticationService:
         self._policy_url = (
             self._issuer.removesuffix("/auth/v1") + "/rest/v1/rpc/account_access"
         )
-        self._keys = SigningKeys(client, str(settings.auth_jwks_url), self._algorithm)
+        self._keys = (
+            keys
+            if keys is not None
+            else SigningKeys(client, str(settings.auth_jwks_url), self._algorithm)
+        )
 
     async def close(self) -> None:
         """Release the public-key HTTP connection pool."""
@@ -54,15 +59,27 @@ class AuthenticationService:
             header = TokenHeader.model_validate(jwt.get_unverified_header(token))
             if header.alg != self._algorithm:
                 raise InvalidCredentials()
-            key = await self._keys.get(header.kid)
+            key = await self._keys.get(header.kid, client=self._client)
+            await key.verify(token)
             claims = AccessClaims.model_validate(
                 jwt.decode(
                     token,
-                    key,
                     algorithms=[self._algorithm],
                     issuer=self._issuer,
                     audience=self._audience,
-                    options={"require": ["iss", "sub", "aud", "exp", "iat"]},
+                    options={
+                        # The host verified the signature above. Preserve all
+                        # PyJWT claim checks when disabling its signature step.
+                        "verify_signature": False,
+                        "verify_exp": True,
+                        "verify_iat": True,
+                        "verify_nbf": True,
+                        "verify_aud": True,
+                        "verify_iss": True,
+                        "verify_sub": True,
+                        "verify_jti": True,
+                        "require": ["iss", "sub", "aud", "exp", "iat"],
+                    },
                 )
             )
         except jwt.PyJWTError, ValidationError, ValueError:
@@ -132,7 +149,9 @@ class AuthenticationService:
             raise AuthenticationUnavailable() from None
 
 
-def build_authentication_service(settings: Settings) -> AuthenticationService | None:
+def build_authentication_service(
+    settings: Settings, *, keys: SigningKeys | None = None
+) -> AuthenticationService | None:
     """Leave protected routes closed when authentication is unconfigured."""
     if settings.auth_issuer is None:
         return None
@@ -142,4 +161,4 @@ def build_authentication_service(settings: Settings) -> AuthenticationService | 
         follow_redirects=False,
         trust_env=False,
     )
-    return AuthenticationService(settings, client)
+    return AuthenticationService(settings, client, keys)

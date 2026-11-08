@@ -16,7 +16,7 @@ router = APIRouter(tags=["hello"])
 
 
 @router.get("/hello", response_model=HelloResponse)
-def hello(
+async def hello(
     name: Annotated[GreetingName, Query(description="Name to greet.")] = "world",
 ) -> HelloResponse:
     """Return a greeting produced by the compiled Rust engine."""

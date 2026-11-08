@@ -5,8 +5,7 @@ import logging
 from time import monotonic
 
 import httpx
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from jwt import PyJWK, PyJWTError
+from jwt import PyJWTError
 from pydantic import JsonValue, ValidationError
 
 from app.authentication.errors import AuthenticationUnavailable, InvalidCredentials
@@ -16,6 +15,7 @@ from app.authentication.models import (
     RSAPublicParameters,
     SigningAlgorithm,
 )
+from app.authentication.signatures import KeyLoader, SignatureKey, load_native_key
 
 logger = logging.getLogger(__name__)
 
@@ -29,17 +29,25 @@ class SigningKeys:
     """Share fetches and bound unknown-kid traffic without ever using stale keys."""
 
     def __init__(
-        self, client: httpx.AsyncClient, url: str, algorithm: SigningAlgorithm
+        self,
+        client: httpx.AsyncClient | None,
+        url: str,
+        algorithm: SigningAlgorithm,
+        *,
+        loader: KeyLoader = load_native_key,
     ) -> None:
         self._client = client
         self._url = url
         self._algorithm = algorithm
-        self._keys: dict[str, PyJWK] = {}
+        self._loader = loader
+        self._keys: dict[str, SignatureKey] = {}
         self._expires_at = 0.0
         self._refresh_after = 0.0
         self._lock = asyncio.Lock()
 
-    async def get(self, key_id: str) -> PyJWK:
+    async def get(
+        self, key_id: str, *, client: httpx.AsyncClient | None = None
+    ) -> SignatureKey:
         now = monotonic()
         if now < self._expires_at and key_id in self._keys:
             return self._keys[key_id]
@@ -55,7 +63,10 @@ class SigningKeys:
             # replaced atomically, so removed keys disappear on the next fetch.
             self._refresh_after = now + _REFRESH_INTERVAL_SECONDS
             try:
-                keys = await self._fetch()
+                transport = client if client is not None else self._client
+                if transport is None:
+                    raise AuthenticationUnavailable()
+                keys = await self._fetch(transport)
             except AuthenticationUnavailable:
                 logger.warning("authentication public keys are unavailable")
                 raise
@@ -66,10 +77,10 @@ class SigningKeys:
                 raise InvalidCredentials()
             return key
 
-    async def _fetch(self) -> dict[str, PyJWK]:
+    async def _fetch(self, client: httpx.AsyncClient) -> dict[str, SignatureKey]:
         try:
             async with asyncio.timeout(5):
-                async with self._client.stream(
+                async with client.stream(
                     "GET",
                     self._url,
                     headers={
@@ -92,15 +103,15 @@ class SigningKeys:
                             raise AuthenticationUnavailable()
                         body.extend(chunk)
             document = PublicKeySet.model_validate_json(body)
-            return _signing_keys(document, self._algorithm)
+            return await _signing_keys(document, self._algorithm, self._loader)
         except httpx.HTTPError, TimeoutError, ValidationError, PyJWTError, ValueError:
             raise AuthenticationUnavailable() from None
 
 
-def _signing_keys(
-    document: PublicKeySet, algorithm: SigningAlgorithm
-) -> dict[str, PyJWK]:
-    keys: dict[str, PyJWK] = {}
+async def _signing_keys(
+    document: PublicKeySet, algorithm: SigningAlgorithm, loader: KeyLoader
+) -> dict[str, SignatureKey]:
+    keys: dict[str, SignatureKey] = {}
     for raw in document.keys:
         if not _eligible(raw, algorithm):
             continue
@@ -113,18 +124,7 @@ def _signing_keys(
             RSAPublicParameters.model_validate(raw)
         else:
             ECPublicParameters.model_validate(raw)
-        key = PyJWK.from_dict(raw, algorithm=algorithm)
-        public_key = key.key
-        if algorithm == "RS256":
-            if not isinstance(public_key, rsa.RSAPublicKey):
-                raise AuthenticationUnavailable()
-            if not 2048 <= public_key.key_size <= 8192:
-                raise AuthenticationUnavailable()
-        elif not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(
-            public_key.curve, ec.SECP256R1
-        ):
-            raise AuthenticationUnavailable()
-        keys[key_id] = key
+        keys[key_id] = await loader(raw, algorithm)
     if not keys:
         raise AuthenticationUnavailable()
     return keys
