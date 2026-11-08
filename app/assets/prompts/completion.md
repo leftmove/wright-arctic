@@ -32,6 +32,7 @@ Your task is to change the given region of writing surrounding the user's cursor
 - When completing partial writing, prefer predictions that save meaningful keystrokes, even if this requires making educated guesses about the user's intent.
 - For writing, it's better to make a substantive prediction that might be rejected than to make a minimal prediction that saves only a few keystrokes.
 - You may use pre-training data to make predictions based on common knowledge-for things like pop culture, or allusions to any other writing.
+- Front matter through Typst details the document's settings-tailor all formatting relative to these defaults.
 
 
 # Input Format
@@ -75,7 +76,7 @@ There is code missing at the cursor location. The related excerpts includes the 
 
 ## Outline
 
-The document but with everything omitted except headers. Elements in-between are listed with descriptive tags, with the "l" property designating the line selection and "c" character count. Empty lines are between all headers and elements, and implied via the line count.
+The document but with everything omitted except headers. Elements in-between are listed with descriptive tags, with the "l" property designating the line selection and "c" character count. Empty lines are between all headers/elements, and implied via line count.
 
 `````
 <frontmatter />
