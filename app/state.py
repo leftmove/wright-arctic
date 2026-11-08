@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from app.authentication.service import AuthenticationService
+from app.services.documents.service import DocumentService
 from app.services.images.service import ImageService
 
 
@@ -12,6 +13,7 @@ class AppResources:
 
     authentication: AuthenticationService | None
     image_service: ImageService | None
+    document_service: DocumentService | None = None
 
     async def close(self) -> None:
         """Release clients held for the life of the process."""
@@ -19,5 +21,9 @@ class AppResources:
             if self.authentication is not None:
                 await self.authentication.close()
         finally:
-            if self.image_service is not None:
-                self.image_service.close()
+            try:
+                if self.image_service is not None:
+                    self.image_service.close()
+            finally:
+                if self.document_service is not None:
+                    self.document_service.close()

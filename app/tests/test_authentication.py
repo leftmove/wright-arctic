@@ -45,6 +45,8 @@ _JWKS = _ISSUER + "/.well-known/jwks.json"
 def configuration(**overrides: JsonValue) -> Settings:
     return Settings.model_validate(
         {
+            "documents_database_url": None,
+            "documents_setup_url": None,
             "auth_issuer": _ISSUER,
             "auth_jwks_url": _JWKS,
             "auth_publishable_key": None

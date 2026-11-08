@@ -1,0 +1,8 @@
+{
+  "name": "wright-arctic-sql-tests",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.15"
+  }
+}

@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     app_name: str = Field(default="wright-arctic", min_length=1)
     debug: bool = False
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    documents_database_url: SecretStr | None = Field(
+        default=None, exclude=True, repr=False
+    )
+    documents_setup_url: SecretStr | None = Field(
+        default=None, exclude=True, repr=False
+    )
+    documents_pool_size: int = Field(default=4, ge=1, le=32)
     auth_issuer: str | None = None
     auth_jwks_url: AnyHttpUrl | None = None
     auth_publishable_key: SecretStr | None = Field(

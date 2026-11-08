@@ -1,4 +1,5 @@
 UV ?= uv
+BUN ?= bun
 
 .DEFAULT_GOAL := help
 .PHONY: help sync dev run stubs check-stubs check test format build
@@ -49,6 +50,7 @@ check:
 	$(UV) run python -m mypy.stubtest engine
 
 test:
+	$(BUN) install --cwd app/tests --frozen-lockfile
 	$(UV) run python -m unittest discover -s app/tests
 
 format:

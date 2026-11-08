@@ -9,6 +9,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.accounts import Account
 from app.authentication.http import authenticate_request
+from app.services.documents.errors import Unavailable
+from app.services.documents.service import DocumentService
 from app.services.images.errors import StorageUnconfigured
 from app.services.images.service import ImageService
 from app.settings import Settings
@@ -51,3 +53,10 @@ def require_image_service(request: Request) -> ImageService:
 
 type SettingsDep = Annotated[Settings, Depends(get_settings)]
 type AccountDep = Annotated[Account, Depends(get_current_account)]
+
+
+def require_document_service(request: Request) -> DocumentService:
+    resources = cast(AppResources, request.app.state.resources)
+    if resources.document_service is None:
+        raise Unavailable()
+    return resources.document_service

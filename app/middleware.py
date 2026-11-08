@@ -111,3 +111,46 @@ def _too_large() -> JSONResponse:
     return JSONResponse(
         status_code=error.status_code, content=error_body(error.code, error.message)
     )
+
+
+class DocumentBodyLimitMiddleware:
+    """Bound multipart and JSON document bodies, including chunked requests."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        path = route_path(scope)
+        if not (path == "/documents" or path.startswith("/documents/")) or scope[
+            "method"
+        ] not in {"POST", "PUT", "PATCH"}:
+            await self._app(scope, receive, send)
+            return
+        maximum = (17 if path.endswith("/changes") else 65) * 1024 * 1024
+        try:
+            if any(length > maximum for length in _content_lengths(scope)):
+                raise ImageTooLarge()
+            payload = await _read_body(receive, maximum)
+        except ImageTooLarge:
+            await JSONResponse(
+                error_body(
+                    "document_too_large", "Document request exceeds its size limit."
+                ),
+                status_code=413,
+            )(scope, receive, send)
+            return
+        except _ClientDisconnected:
+            return
+        delivered = False
+
+        async def replay() -> Message:
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            delivered = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        await self._app(scope, replay, send)
