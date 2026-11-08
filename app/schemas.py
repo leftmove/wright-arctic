@@ -62,6 +62,13 @@ class ImageListResponse(ResponseModel):
     images: list[ImageSummary]
 
 
+class PortraitSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    image_id: UUID = Field(strict=False)
+    if_absent: bool = False
+
+
 def error_body(code: str, message: str) -> dict[str, str]:
     """Return the JSON object used for image API failures."""
     payload = ErrorResponse(code=code, message=message)

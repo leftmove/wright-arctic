@@ -12,7 +12,7 @@ from app.authentication.http import (
 )
 from app.dependencies import get_settings
 from app.middleware import ImageUploadLimitMiddleware
-from app.routers import health, hello, images, root
+from app.routers import account, health, hello, images, root
 from app.routers.images import install_image_error_handler
 from app.services.images import build_image_service
 from app.services.images.limits import MAX_UPLOAD_BODY_BYTES
@@ -47,6 +47,7 @@ def create_app() -> FastAPI:
     application.include_router(health.router)
     application.include_router(hello.router)
     application.include_router(images.router)
+    application.include_router(account.router)
     application.add_middleware(
         ImageUploadLimitMiddleware,
         max_body_bytes=MAX_UPLOAD_BODY_BYTES,
@@ -56,7 +57,7 @@ def create_app() -> FastAPI:
     application.add_middleware(
         AuthenticationMiddleware,
         service=resources.authentication,
-        protected_prefixes=(images.router.prefix,),
+        protected_prefixes=(images.router.prefix, account.router.prefix),
     )
     return application
 

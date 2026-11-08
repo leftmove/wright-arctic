@@ -16,6 +16,7 @@ target
 .venv
 .mypy_cache/
 .ruff_cache/
+.cache/
 
 # Local secrets
 .env*

@@ -33,6 +33,18 @@ class AccessClaims(BaseModel):
     exp: int = Field(gt=0)
     iat: int = Field(gt=0)
     nbf: int | None = None
+    role: Literal["authenticated"]
+    is_anonymous: Literal[False]
+    session_id: str = Field(min_length=36, max_length=36)
+    aal: Literal["aal1", "aal2"]
+    amr: list[AuthenticationMethod] = Field(min_length=1, max_length=32)
+
+
+class AuthenticationMethod(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True, frozen=True)
+
+    method: Literal["oauth", "password", "passkey", "totp", "mfa/totp"]
+    timestamp: int = Field(gt=0)
 
 
 class PublicKeySet(BaseModel):

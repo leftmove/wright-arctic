@@ -97,6 +97,61 @@ class S3ImageStore:
         """Close the underlying HTTP connection pool."""
         self._client.close()
 
+    def portrait_id(self, account: Account) -> UUID | None:
+        """Read a small account-owned selection, separate from immutable images."""
+
+        def read() -> UUID:
+            response = self._client.get_object(
+                Bucket=self._bucket, Key=f"accounts/{account.storage_key}/portrait"
+            )
+            body = response["Body"]
+            try:
+                value = body.read(37)
+            finally:
+                body.close()
+            if len(value) != 36:
+                raise StorageInvalid()
+            try:
+                return UUID(value.decode("ascii"))
+            except ValueError, UnicodeError:
+                raise StorageInvalid() from None
+
+        try:
+            return self._invoke(read, missing_ok=True)
+        except ImageNotFound:
+            return None
+
+    def select_portrait(
+        self, account: Account, image_id: UUID, *, if_absent: bool = False
+    ) -> None:
+        """Selection cannot point outside the verified account's object namespace."""
+        self.get_image(account, image_id)
+
+        def write() -> None:
+            parameters: PutObjectRequestTypeDef = {
+                "Bucket": self._bucket,
+                "Key": f"accounts/{account.storage_key}/portrait",
+                "Body": str(image_id).encode("ascii"),
+                "Metadata": {},
+                "ContentType": "text/plain",
+                "CacheControl": "private, no-store",
+                "ContentDisposition": "inline",
+            }
+            if if_absent:
+                parameters["IfNoneMatch"] = "*"
+            try:
+                self._client.put_object(**parameters)
+            except ClientError as exc:
+                if if_absent and (
+                    _error_code(exc)
+                    in {"PreconditionFailed", "ConditionalRequestConflict"}
+                    or _http_status(exc) in {409, 412}
+                ):
+                    return
+                raise
+
+        self._invoke(write)
+
     def put_image(
         self,
         account: Account,

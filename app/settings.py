@@ -34,9 +34,12 @@ class Settings(BaseSettings):
     api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
     auth_issuer: str | None = None
     auth_jwks_url: AnyHttpUrl | None = None
-    auth_audience: str = Field(default="convex", min_length=1, max_length=256)
-    auth_algorithm: Literal["RS256", "ES256"] = "RS256"
-    auth_max_token_lifetime_seconds: int = Field(default=3600, ge=60, le=3600)
+    auth_publishable_key: SecretStr | None = Field(
+        default=None, exclude=True, repr=False
+    )
+    auth_audience: str = Field(default="authenticated", min_length=1, max_length=256)
+    auth_algorithm: Literal["RS256", "ES256"] = "ES256"
+    auth_max_token_lifetime_seconds: int = Field(default=900, ge=60, le=900)
     storage_endpoint_url: AnyHttpUrl | None = None
     storage_region: str | None = None
     storage_bucket: str | None = None
@@ -69,11 +72,34 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _auth_settings_are_complete(self) -> Self:
-        if (self.auth_issuer is None) != (self.auth_jwks_url is None):
+        configured = (
+            self.auth_issuer is not None,
+            self.auth_jwks_url is not None,
+            _secret_configured(self.auth_publishable_key),
+        )
+        if any(configured) and not all(configured):
             raise ValueError(
-                "WRIGHT_ARCTIC_AUTH_ISSUER and WRIGHT_ARCTIC_AUTH_JWKS_URL "
+                "WRIGHT_ARCTIC_AUTH_ISSUER, WRIGHT_ARCTIC_AUTH_JWKS_URL and WRIGHT_ARCTIC_AUTH_PUBLISHABLE_KEY "
                 "must be set together"
             )
+        if self.auth_issuer is not None:
+            if (
+                not self.auth_issuer.endswith("/auth/v1")
+                or str(self.auth_jwks_url)
+                != self.auth_issuer + "/.well-known/jwks.json"
+            ):
+                raise ValueError("Use one Supabase project's exact issuer and JWKS URL")
+            if (
+                self.auth_publishable_key is None
+                or not self.auth_publishable_key.get_secret_value().startswith(
+                    "sb_publishable_"
+                )
+            ):
+                raise ValueError("A public Supabase publishable key is required")
+            if self.auth_audience != "authenticated":
+                raise ValueError(
+                    "Supabase user tokens require the authenticated audience"
+                )
         return self
 
     @field_validator("storage_endpoint_url", "storage_public_base_url")
