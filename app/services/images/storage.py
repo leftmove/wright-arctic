@@ -53,8 +53,7 @@ _RETRY_ATTEMPTS = 3
 _LIST_PAGE_SIZE = 1000
 _MAX_LIST_PAGES = 20
 _OBJECT_KEY = re.compile(
-    r"^accounts/"
-    r"(?P<account>[0-9a-f]{64})"
+    r"^(?P<account>[0-9a-f]{64})"
     r"/images/"
     r"(?P<image>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
     r"\.(?P<ext>jxl|avif|webp)$"
@@ -96,7 +95,7 @@ class ImageStore:
 
     def portrait_id(self, account: Account) -> UUID | None:
         try:
-            value = self._objects.read(f"accounts/{account.storage_key}/portrait", 36)
+            value = self._objects.read(f"{account.storage_key}/portrait", 36)
         except ImageNotFound:
             return None
         if len(value) != 36:
@@ -111,7 +110,7 @@ class ImageStore:
     ) -> None:
         self.get_image(account, image_id)
         self._objects.put(
-            f"accounts/{account.storage_key}/portrait",
+            f"{account.storage_key}/portrait",
             str(image_id).encode("ascii"),
             media_type="text/plain",
             cache_control="private, no-store",
@@ -450,7 +449,7 @@ def object_key(
 
 def account_prefix(account: Account) -> str:
     """Return the key prefix that contains one account's images."""
-    return f"accounts/{account.storage_key}/images/"
+    return f"{account.storage_key}/images/"
 
 
 def _secret_text(value: SecretStr | None) -> str | None:
