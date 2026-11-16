@@ -47,7 +47,9 @@ async def list_documents(
         cursor=decode_cursor(cursor, offset=offset),
     )
     if len(documents) == limit:
-        response.headers["X-Next-Cursor"] = encode_cursor(documents[-1].updated_at, documents[-1].id)
+        response.headers["X-Next-Cursor"] = encode_cursor(
+            documents[-1].updated_at, documents[-1].id
+        )
     return documents
 
 

@@ -20,6 +20,7 @@ from uuid import UUID
 
 from app.services.database import Row, Session
 from app.services.errors import Conflict, Unavailable
+from app.services.operations import check_rejection
 
 
 def _encode(value: object) -> object:
@@ -112,10 +113,32 @@ class FixtureDatabase:
         )
         if "error" in result:
             error = cast(dict[str, object], result["error"])
+            check_rejection(
+                cast(str | None, error.get("code")),
+                cast(str | None, error.get("detail")),
+            )
             if error.get("code") in {"23505", "23503", "23514", "23001"}:
                 raise Conflict()
             raise RuntimeError(str(error))
         return cast(list[Row], result["rows"])
+
+    def fetch(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        with self.lock:
+            self.execute("set role arctic_catalog")
+            try:
+                return self.execute(query, parameters)
+            finally:
+                self.execute("reset role")
+
+    def notifications(self) -> list[int]:
+        with self.lock:
+            self.input.write('{"notifications":true}\n')
+            self.input.flush()
+            return cast(list[int], json.loads(self.output.readline()))
+
+    def write(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        with self.transaction() as session:
+            return session.execute(query, parameters)
 
     @contextmanager
     def transaction(self) -> Iterator[Session]:

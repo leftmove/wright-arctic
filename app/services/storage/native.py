@@ -9,10 +9,8 @@ from typing import Literal
 import httpx
 
 from app.observability import span
-from app.services.limits import MAX_IMAGE_BYTES
 from app.services.storage.objects import (
     AsyncCheckpointObjects,
-    AsyncImageBody,
     AsyncImageObjects,
     ObjectMetadata,
     ObjectMissing,
@@ -83,39 +81,6 @@ class HTTPObjects:
             async for chunk in response.aiter_bytes(chunk_size=maximum):
                 return chunk[:maximum]
         return b""
-
-    async def stream(self, key: str) -> AsyncImageBody:
-        context = self._request("GET", key)
-        response = await context.__aenter__()
-
-        async def close() -> None:
-            await context.__aexit__(None, None, None)
-
-        try:
-            size = int(response.headers.get("content-length", "-1"))
-            if (
-                not 0 < size <= MAX_IMAGE_BYTES
-                or response.headers.get("content-type") != "image/avif"
-            ):
-                raise StorageUnavailable()
-
-            async def chunks() -> AsyncIterator[bytes]:
-                remaining = size
-                try:
-                    async for chunk in response.aiter_bytes(chunk_size=65536):
-                        if len(chunk) > remaining:
-                            raise StorageUnavailable()
-                        remaining -= len(chunk)
-                        yield chunk
-                    if remaining:
-                        raise StorageUnavailable()
-                except httpx.HTTPError:
-                    raise StorageUnavailable() from None
-
-            return AsyncImageBody(size, chunks(), close)
-        except BaseException:
-            await close()
-            raise
 
 
 @dataclass(frozen=True)

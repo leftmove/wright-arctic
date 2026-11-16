@@ -27,7 +27,7 @@ from app.services.storage.factory import Storage, signer
 from app.settings import Settings
 from app.state import AppResources, legacy_resources
 from app.worker_crypto import load_web_key
-from app.worker_storage import Buffer, R2Bucket, R2ImageBody, R2Objects
+from app.worker_storage import Buffer, R2Bucket, R2Objects
 
 
 class HyperdriveBinding(Protocol):
@@ -53,7 +53,11 @@ def binding_settings(environment: object) -> Settings:
         return _settings
     values: dict[str, str] = {}
     for name in Settings.model_fields:
-        if name in {"documents_setup_url", "documents_database_url"}:
+        if name in {
+            "documents_setup_url",
+            "documents_database_url",
+            "documents_listener_url",
+        }:
             continue
         value: object = getattr(environment, "WRIGHT_ARCTIC_" + name.upper(), None)
         if isinstance(value, str):
@@ -167,7 +171,6 @@ class Default(WorkerEntrypoint):
                 if scope["type"] == "lifespan":
                     return
                 scope["state"] = state
-                scope.setdefault("extensions", {})["wright.native_image_stream"] = True
                 await _application(scope, receive, send)
 
             try:
@@ -217,20 +220,7 @@ class Default(WorkerEntrypoint):
                             )
                         chunks.append(data)
                     request = _request(request, body=b"".join(chunks))
-                asgi_response = Response(
-                    await asgi.fetch(application, request, self.env)
-                )
-                if (body := state.get("image_body")) is not None:
-                    if not isinstance(body, R2ImageBody):
-                        raise RuntimeError(
-                            "The Worker requires a native R2 image stream"
-                        )
-                    return _response(
-                        body.native_stream,
-                        status=asgi_response.status,
-                        headers=dict(cast(HTTPMessage, asgi_response.headers).items()),
-                    )
-                return asgi_response
+                return Response(await asgi.fetch(application, request, self.env))
             finally:
                 await resources.close()
 

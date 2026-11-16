@@ -1,6 +1,6 @@
 """Separate checkpoint metadata access from image byte delivery."""
 
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -24,13 +24,6 @@ class ObjectMetadata:
     metadata: Mapping[str, str]
 
 
-@dataclass(frozen=True)
-class ImageBody:
-    size: int
-    chunks: Iterator[bytes]
-    close: Callable[[], None]
-
-
 class CheckpointObjects(Protocol):
     """The sync service cannot fetch document bytes through this interface."""
 
@@ -41,15 +34,6 @@ class CheckpointObjects(Protocol):
 
 class ImageObjects(CheckpointObjects, Protocol):
     def prefix(self, key: str, maximum: int) -> bytes: ...
-    def stream(self, key: str) -> ImageBody: ...
-
-
-@dataclass(frozen=True)
-class AsyncImageBody:
-    size: int
-    chunks: AsyncIterator[bytes]
-    close: Callable[[], Awaitable[None]]
-    native: ImageBody | None = None
 
 
 class AsyncCheckpointObjects(Protocol):
@@ -59,4 +43,3 @@ class AsyncCheckpointObjects(Protocol):
 
 class AsyncImageObjects(AsyncCheckpointObjects, Protocol):
     async def prefix(self, key: str, maximum: int) -> bytes: ...
-    async def stream(self, key: str) -> AsyncImageBody: ...

@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     documents_setup_url: SecretStr | None = Field(
         default=None, exclude=True, repr=False
     )
+    documents_listener_url: SecretStr | None = Field(
+        default=None, exclude=True, repr=False
+    )
     documents_pool_size: int = Field(default=4, ge=1, le=32)
     storage_concurrency: int = Field(default=8, ge=1, le=32)
     application_deadline_seconds: float = Field(default=10, ge=1, le=30)

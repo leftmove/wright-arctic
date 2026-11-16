@@ -4,16 +4,19 @@ WRIGHT_ARCTIC_TEST_POSTGRES_URL must name a private runtime login, never the
 administrator. Only accounts/documents allocated by each test are removed.
 """
 
+import asyncio
 import os
 import time
 import unittest
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from threading import Barrier
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid7
 
 import psycopg
+from psycopg.pq import TransactionStatus
 from pydantic import SecretStr, TypeAdapter
 
 from app.accounts import Identity
@@ -25,15 +28,26 @@ from app.schemas import (
     StartBatch,
     UploadSlot,
 )
+from app.services.catalog.copy import (
+    CHANGES,
+    SNAPSHOT,
+    CatalogCopy,
+    Snapshot,
+    SnapshotRows,
+)
+from app.services.catalog.listener import CatalogListener, Connection
 from app.services.database import (
     PostgresDatabase,
     PostgresSession,
+    Row,
     Session,
     verify_runtime,
 )
 from app.services.documents.service import DocumentService
 from app.services.identity.service import IdentityService
 from app.services.models import Account
+from app.services.native_database import NativeDatabase
+from app.services.operations import check_rejection
 from app.services.storage.signing import S3Signer
 from app.services.sync.service import SyncService
 from app.tests import async_support
@@ -51,6 +65,17 @@ class ConnectionDatabase:
     def close(self) -> None:
         self.connection.close()
 
+    def fetch(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        return PostgresSession(self.connection).execute(query, parameters)
+
+    def write(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        try:
+            with self.transaction() as session:
+                return session.execute(query, parameters)
+        except psycopg.Error as error:
+            check_rejection(error.sqlstate, error.diag.message_detail)
+            raise
+
     @contextmanager
     def transaction(self) -> Iterator[Session]:
         with self.connection.transaction():
@@ -62,6 +87,164 @@ class ConnectionDatabase:
                 session.execute("select pg_backend_pid() as pid")[0]["pid"]
             )
             yield session
+
+
+class NativeExchangeTests(unittest.IsolatedAsyncioTestCase):
+    snapshot = Snapshot(
+        number=3,
+        records=SnapshotRows(
+            accounts=[],
+            spaces=[],
+            documents=[],
+            grants=[],
+            checkpoints=[],
+            images=[],
+            image_references=[],
+        ),
+    )
+
+    async def test_listener_reconnects_and_replays_from_the_snapshot(self) -> None:
+        copy = CatalogCopy()
+        listener = CatalogListener("dbname=arctic_test", copy)
+        first = MagicMock(close=AsyncMock())
+        second = MagicMock(close=AsyncMock())
+        dropped, trying, reconnect, caught_up = (asyncio.Event() for _ in range(4))
+        reads: list[tuple[str, Sequence[object]]] = []
+
+        async def connect() -> Connection:
+            if not reads:
+                return first
+            trying.set()
+            await reconnect.wait()
+            return second
+
+        async def notices(connection: Connection) -> AsyncIterator[int]:
+            if connection is first and await dropped.wait():
+                raise psycopg.OperationalError("test disconnect")
+            await asyncio.Future[None]()
+            yield 5
+
+        async def fetch(
+            _connection: Connection,
+            query: str,
+            parameters: Sequence[object] = (),
+        ) -> list[Row]:
+            reads.append((query, parameters))
+            if query == SNAPSHOT:
+                return [self.snapshot.model_dump()]
+            caught_up.set()
+            return [
+                {
+                    "number": 5,
+                    "relation": "spaces",
+                    "previous": None,
+                    "current": {
+                        "id": uuid7(),
+                        "owner": uuid7(),
+                        "created_at": "2026-11-16T00:00:00Z",
+                    },
+                }
+            ]
+
+        with (
+            patch.object(listener, "_connect", side_effect=connect),
+            patch.object(listener, "_notices", side_effect=notices),
+            patch("app.services.catalog.listener.fetch", side_effect=fetch),
+        ):
+            try:
+                await listener.open()
+                self.assertIsNotNone(copy.readable)
+                dropped.set()
+                await asyncio.wait_for(trying.wait(), timeout=2)
+                self.assertIsNone(copy.readable)
+                reconnect.set()
+                await asyncio.wait_for(caught_up.wait(), timeout=2)
+                self.assertIsNotNone(copy.readable)
+                self.assertEqual(copy.applied, 5)
+                self.assertEqual(reads[-1][1][0], self.snapshot.number)
+            finally:
+                await listener.close()
+        first.close.assert_awaited_once()
+        second.close.assert_awaited_once()
+
+    async def test_native_pipeline_waits_once_after_commit_and_local_delta(
+        self,
+    ) -> None:
+        copy = CatalogCopy()
+        copy.load(self.snapshot)
+        copy.connected = True
+        native = NativeDatabase("dbname=arctic_test", catalog=copy)
+        events: list[object] = []
+        connection = MagicMock()
+        connection.closed = False
+        connection.pgconn.transaction_status = TransactionStatus.IDLE
+        pipeline = connection.pipeline.return_value
+        (work, changes) = (MagicMock(), MagicMock())
+        connection.cursor.side_effect = (work, changes, work, changes)
+        work.__aenter__.return_value = work
+        changes.__aenter__.return_value = changes
+
+        async def sent(
+            query: str, parameters: Sequence[object] = (), *, prepare: bool = False
+        ) -> None:
+            events.append((query, parameters))
+
+        async def sync(*_args: object) -> None:
+            events.append("sync")
+
+        async def result() -> list[Row]:
+            events.append("work result")
+            return [{"result": 1}]
+
+        account = uuid7()
+        space = uuid7()
+
+        async def delta() -> list[Row]:
+            events.append("delta")
+            return [
+                {
+                    "number": 5,
+                    "relation": "spaces",
+                    "previous": None,
+                    "current": {
+                        "owner": account,
+                        "id": space,
+                        "created_at": "2026-11-16T00:00:00Z",
+                    },
+                }
+            ]
+
+        connection.execute = AsyncMock(side_effect=sent)
+        work.execute = AsyncMock(side_effect=sent)
+        changes.execute = AsyncMock(side_effect=sent)
+        pipeline.__aexit__.side_effect = sync
+        work.fetchall = AsyncMock(side_effect=result)
+        changes.fetchall = AsyncMock(side_effect=delta)
+        with (
+            patch.object(
+                native._pool, "getconn", new=AsyncMock(return_value=connection)
+            ),
+            patch.object(native._pool, "putconn", new=AsyncMock()),
+        ):
+            self.assertEqual(await native.fetch("select %s", (1,)), [{"result": 1}])
+            self.assertEqual(events, [("select %s", (1,)), "sync", "work result"])
+            events.clear()
+            await native.write("select grouped_write(%s)", (1,))
+        self.assertEqual(
+            events,
+            [
+                ("begin isolation level read committed", ()),
+                ("select grouped_write(%s)", (1,)),
+                ("commit", ()),
+                (CHANGES, (3,)),
+                "sync",
+                "delta",
+                "work result",
+            ],
+        )
+        self.assertEqual(copy.applied, 5)
+        assert copy.readable is not None
+        self.assertIn(space, copy.readable.spaces.members(account))
 
 
 @unittest.skipUnless(

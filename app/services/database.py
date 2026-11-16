@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from contextlib import (
-    AbstractAsyncContextManager,
     AbstractContextManager,
     contextmanager,
 )
@@ -19,15 +18,13 @@ from app.services.errors import Conflict, Unavailable
 type Row = dict[str, object]
 
 
-class AsyncSession(Protocol):
-    async def execute(
+class AsyncDatabase(Protocol):
+    async def fetch(
         self, query: str, parameters: Sequence[object] = ()
     ) -> list[Row]: ...
-
-
-class AsyncDatabase(Protocol):
-    def transaction(self) -> AbstractAsyncContextManager[AsyncSession]: ...
-    def read(self) -> AbstractAsyncContextManager[AsyncSession]: ...
+    async def write(
+        self, query: str, parameters: Sequence[object] = ()
+    ) -> list[Row]: ...
     async def open(self) -> None: ...
     async def close(self) -> None: ...
 
@@ -43,6 +40,8 @@ class Database(Protocol):
     """Transactions use READ COMMITTED so permission reads follow acquired locks."""
 
     def transaction(self) -> AbstractContextManager[Session]: ...
+    def fetch(self, query: str, parameters: Sequence[object] = ()) -> list[Row]: ...
+    def write(self, query: str, parameters: Sequence[object] = ()) -> list[Row]: ...
     def open(self) -> None: ...
     def close(self) -> None: ...
 
@@ -103,6 +102,30 @@ class PostgresDatabase:
         except Error as error:
             raise_database_error(error.sqlstate)
 
+    def fetch(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        from psycopg import Error
+
+        from app.services.operations import check_rejection
+
+        try:
+            with self._pool.connection() as connection:
+                return PostgresSession(connection).execute(query, parameters)
+        except Error as error:
+            check_rejection(error.sqlstate, error.diag.message_detail)
+            raise_database_error(error.sqlstate)
+
+    def write(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        from app.services.operations import check_rejection
+
+        with self.transaction() as session:
+            from psycopg import Error
+
+            try:
+                return session.execute(query, parameters)
+            except Error as error:
+                check_rejection(error.sqlstate, error.diag.message_detail)
+                raise
+
 
 def raise_database_error(sqlstate: str | None) -> NoReturn:
     if sqlstate in {"40001", "40P01", "55P03"}:
@@ -155,7 +178,8 @@ def verify_catalog(session: Session) -> None:
         ("coordination", "images"),
         ("coordination", "uploads"),
     }
-    if {(row["nspname"], row["relname"]) for row in flags} != expected or any(
+    installed = {(row["nspname"], row["relname"]) for row in flags}
+    if installed - {("coordination", "catalog_changes")} != expected or any(
         row["relrowsecurity"] for row in flags
     ):
         raise Unavailable()

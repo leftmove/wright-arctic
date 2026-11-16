@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from app.services.limits import MAX_IMAGE_BYTES
 from app.services.storage.objects import (
-    ImageBody,
     ObjectMetadata,
     ObjectMissing,
     StorageUnavailable,
@@ -65,24 +63,3 @@ class S3Objects:
             return self._invoke(lambda: body.read(maximum))
         finally:
             body.close()
-
-    def stream(self, key: str) -> ImageBody:
-        value = self._invoke(
-            lambda: self._client.get_object(Bucket=self._bucket, Key=key)
-        )
-        body = value["Body"]
-        size = value["ContentLength"]
-        if not 0 < size <= MAX_IMAGE_BYTES or value.get("ContentType") != "image/avif":
-            body.close()
-            raise StorageUnavailable()
-
-        def chunks() -> Iterator[bytes]:
-            remaining = size
-            while remaining:
-                chunk = self._invoke(lambda: body.read(65536))
-                if not chunk or len(chunk) > remaining:
-                    raise StorageUnavailable()
-                remaining -= len(chunk)
-                yield chunk
-
-        return ImageBody(size, chunks(), body.close)

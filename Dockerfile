@@ -36,20 +36,14 @@ RUN groupadd --gid 10001 app \
 
 WORKDIR /app
 
-COPY --from=build /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=build /app/.venv /app/.venv
 COPY --from=build /app/pyproject.toml /app/uv.lock /app/README.md ./
 COPY app ./app
 
-RUN chmod -R a+rX /app /usr/local/bin/uv
+RUN /usr/local/bin/python3 -m compileall -q /app/app \
+    && chmod -R a+rX /app
 
-ENV UV_PYTHON=/usr/local/bin/python3 \
-    UV_PYTHON_DOWNLOADS=never \
-    UV_LINK_MODE=copy \
-    UV_NO_SYNC=1 \
-    UV_PROJECT_ENVIRONMENT=/app/.venv \
-    UV_CACHE_DIR=/tmp/uv-cache \
-    PATH=/app/.venv/bin:/usr/local/bin:$PATH \
+ENV PATH=/app/.venv/bin:/usr/local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PORT=8000
 
@@ -57,4 +51,4 @@ USER app
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "exec uv run --no-sync --offline --no-dev --python /usr/local/bin/python3 python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["/app/.venv/bin/python", "-m", "app"]

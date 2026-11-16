@@ -5,11 +5,13 @@ import unittest
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4, uuid7
 
 from pydantic import ValidationError
 
-from app.accounts import Identity
+from app.accounts import Identity, VerifiedActor
 from app.schemas import (
     CheckpointUpload,
     CreateDocument,
@@ -20,6 +22,8 @@ from app.schemas import (
     StartBatch,
     UploadSlot,
 )
+from app.services.catalog.copy import CHANGES, SNAPSHOT, CatalogCopy, Change, Snapshot
+from app.services.catalog.reader import CatalogReader
 from app.services.cleanup import CheckpointJob, CleanupService, ImageJob
 from app.services.database import Row, verify_runtime
 from app.services.documents.service import DocumentService
@@ -29,7 +33,7 @@ from app.services.images.service import ImageService
 from app.services.limits import MAX_CHECKPOINT_BYTES, MAX_IMAGE_BYTES
 from app.services.models import Account
 from app.services.storage.factory import Storage
-from app.services.storage.objects import ImageBody, ObjectMetadata
+from app.services.storage.objects import ObjectMetadata
 from app.services.storage.signing import S3Signer
 from app.services.sync.service import Attempt, SyncService
 from app.tests import async_support
@@ -556,6 +560,14 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(result.checkpoints, 1)
         self.assertNotIn(slot.key, self.checkpoints.objects)
 
+    def expire_cleanup_claims(self) -> None:
+        # Exercise the next scheduled attempt without waiting for its lease/backoff.
+        with self.db.admin_transaction() as session:
+            session.execute(
+                "update documents.checkpoints set cleanup_after='-infinity'"
+            )
+            session.execute("update coordination.uploads set cleanup_after='-infinity'")
+
     def test_cleanup_database_conflicts_preserve_pending_work(self) -> None:
         from unittest.mock import patch
 
@@ -565,7 +577,7 @@ class DocumentTests(unittest.TestCase):
         def fail_delete_recording(
             query: str, parameters: Sequence[object] = ()
         ) -> list[Row]:
-            if "set state='deleted'" in query:
+            if "set state='deleted'" in query or "coordination.finish_cleanup" in query:
                 raise Conflict("retry_transaction")
             return original(query, parameters)
 
@@ -594,6 +606,7 @@ class DocumentTests(unittest.TestCase):
                 session.execute("select state from documents.checkpoints"),
                 [{"state": "pending"}],
             )
+        self.expire_cleanup_claims()
         self.assertEqual(async_support.run(self.cleanup.run()).checkpoints, 1)
 
     def test_pointer_and_image_links_roll_back_when_commit_fails(self) -> None:
@@ -701,6 +714,7 @@ class DocumentTests(unittest.TestCase):
                 session.execute("select state from coordination.uploads"),
                 [{"state": "pending"}],
             )
+        self.expire_cleanup_claims()
         result = async_support.run(self.cleanup.run())
         self.assertEqual(
             (result.checkpoints, result.images, result.failures), (1, 1, 0)
@@ -728,6 +742,7 @@ class DocumentTests(unittest.TestCase):
                 self.documents.lifecycle(self.owner, self.document.id, trashed=False)
             )
         self.checkpoints.fail_delete = False
+        self.expire_cleanup_claims()
         self.assertEqual(async_support.run(self.cleanup.run()).documents, 1)
         self.assertNotIn(slot.key, self.checkpoints.objects)
         with self.assertRaises(NotFound):
@@ -756,10 +771,9 @@ class DocumentTests(unittest.TestCase):
         )
         self.checkpoints.upload(retry)
         self.assertEqual(self.publish(batch, retry, images=[editor_image]), "published")
-        self.assertEqual(
-            async_support.run(self.media.content(self.viewer, editor_image))[0].id,
-            editor_image,
-        )
+        download = async_support.run(self.media.content(self.viewer, editor_image))
+        self.assertEqual(download.method, "GET")
+        self.assertTrue(urlsplit(download.url).path.endswith(f"/{editor_image}"))
         async_support.run(
             self.documents.grant(self.owner, self.document.id, self.editor.id, None)
         )
@@ -771,6 +785,116 @@ class DocumentTests(unittest.TestCase):
         )
         with self.assertRaises(ServiceError):
             async_support.run(self.media.delete(self.editor, editor_image))
+
+    def test_catalog_reads_each_use_one_autocommit_statement(self) -> None:
+        image = self.image()
+        async_support.run(self.identity.select_avatar(self.owner, image))
+        actor = VerifiedActor(
+            Identity(subject=self.owner.subject, issuer=self.owner.issuer)
+        )
+        with (
+            patch.object(self.db, "fetch", wraps=self.db.fetch) as fetch,
+            patch.object(
+                self.db,
+                "transaction",
+                side_effect=AssertionError("read opened a transaction"),
+            ),
+        ):
+            reads = (
+                self.identity.current(actor),
+                self.documents.spaces(actor),
+                self.documents.list_documents(actor, trashed=False, limit=10, offset=0),
+                self.documents.metadata(actor, self.document.id),
+                self.documents.grants(actor, self.document.id),
+                self.sync.open(actor, self.document.id, None),
+                self.sync.checkpoints(actor, self.document.id),
+                self.media.list_images(actor, limit=10, offset=0),
+                self.media.metadata(actor, image),
+                self.media.avatar(self.owner.id),
+            )
+            for read in reads:
+                fetch.reset_mock()
+                async_support.run(read)
+                fetch.assert_called_once()
+        first_visit = VerifiedActor(
+            Identity(subject="new-visitor", issuer=self.owner.issuer)
+        )
+        self.assertEqual(len(async_support.run(self.documents.spaces(first_visit))), 1)
+
+    def test_catalog_snapshot_replays_only_committed_changes(self) -> None:
+        image = self.image()
+        async_support.run(self.identity.select_avatar(self.owner, image))
+        batch, slot = self.start()
+        self.checkpoints.upload(slot)
+        self.assertEqual(self.publish(batch, slot, images=[image]), "published")
+
+        copy = CatalogCopy()
+        copy.load(Snapshot.model_validate(self.db.fetch(SNAPSHOT)[0]))
+        copy.connected = True
+        reader = CatalogReader(async_support.database(self.db), copy)
+        actor = VerifiedActor(
+            Identity(subject=self.viewer.subject, issuer=self.viewer.issuer)
+        )
+        self.db.notifications()
+        with patch.object(
+            self.db,
+            "fetch",
+            side_effect=AssertionError("snapshot should serve the read"),
+        ):
+            self.assertEqual(
+                async_support.run(reader.document(actor, self.document.id)).revision,
+                slot.revision,
+            )
+            self.assertEqual(
+                async_support.run(reader.checkpoints(actor, self.document.id))[
+                    0
+                ].revision,
+                slot.revision,
+            )
+            self.assertEqual(async_support.run(reader.image(actor, image)).id, image)
+            self.assertEqual(async_support.run(reader.avatar(self.owner.id)).id, image)
+
+        def revoke() -> None:
+            async_support.run(
+                self.documents.grant(self.owner, self.document.id, self.viewer.id, None)
+            )
+
+        self.db.fail_commit = True
+        with self.assertRaises(Unavailable):
+            revoke()
+        self.assertEqual(self.db.notifications(), [])
+        self.assertEqual(self.db.fetch(CHANGES, (copy.applied,)), [])
+        revoke()
+        copy.notified = max(self.db.notifications())
+        self.assertIsNone(copy.readable)
+        with (
+            patch.object(self.db, "fetch", wraps=self.db.fetch) as fetch,
+            self.assertRaises(NotFound),
+        ):
+            async_support.run(reader.image(actor, image))
+        fetch.assert_called_once()
+
+        copy.connected = (
+            False  # The listener dropped before it could read the noticed change.
+        )
+        async_support.run(
+            self.documents.rename(
+                self.owner, self.document.id, "Committed while disconnected"
+            )
+        )
+        copy.apply(map(Change.model_validate, self.db.fetch(CHANGES, (copy.applied,))))
+        copy.connected = True
+        with patch.object(
+            self.db,
+            "fetch",
+            side_effect=AssertionError("catch-up should serve the read"),
+        ):
+            self.assertEqual(
+                async_support.run(reader.document(self.owner, self.document.id)).title,
+                "Committed while disconnected",
+            )
+            with self.assertRaises(NotFound):
+                async_support.run(reader.image(actor, image))
 
     def test_avif_size_format_quota_and_confirm_idempotency(self) -> None:
         data = AVIF + b"\x00" * (MAX_IMAGE_BYTES - len(AVIF))
@@ -815,9 +939,9 @@ class DocumentTests(unittest.TestCase):
         with self.assertRaises(NotFound):
             async_support.run(self.media.metadata(self.viewer, image))
         async_support.run(self.identity.select_avatar(self.owner, image))
-        self.assertEqual(
-            async_support.run(self.media.avatar(self.owner.id))[0].id, image
-        )
+        download = async_support.run(self.media.avatar(self.owner.id))
+        self.assertEqual(download.method, "GET")
+        self.assertTrue(urlsplit(download.url).path.endswith(f"/{image}"))
         with self.assertRaises(NotFound):
             async_support.run(self.identity.select_avatar(self.viewer, image))
         with self.assertRaises(ServiceError):
@@ -1040,16 +1164,16 @@ class DocumentTests(unittest.TestCase):
                 authentication=authentication,
             )
         )
-        with TestClient(application) as client:
+        with TestClient(application, follow_redirects=False) as client:
             public = client.get(f"/avatars/{self.owner.id}")
-            self.assertEqual(public.status_code, 200)
-            self.assertEqual(public.content, AVIF)
-            self.assertEqual(public.headers["cache-control"], "public, max-age=300")
+            self.assertEqual(public.status_code, 307)
+            self.assertEqual(public.content, b"")
+            self.assertEqual(public.headers["cache-control"], "private, no-store")
             self.assertNotIn("authorization", public.headers.get("vary", "").lower())
             self.assertEqual(client.get(f"/images/{image}/content").status_code, 401)
             headers = {"Authorization": "Bearer test"}
             self.assertEqual(
-                client.get(f"/images/{image}/content", headers=headers).status_code, 200
+                client.get(f"/images/{image}/content", headers=headers).status_code, 307
             )
             self.assertEqual(
                 client.get(
@@ -1088,13 +1212,12 @@ class DocumentTests(unittest.TestCase):
             )
             self.assertEqual(oversized.status_code, 413)
 
-    def test_native_image_stream_handoff_preserves_authorization_and_headers(
+    def test_download_redirects_sign_only_the_authorized_object(
         self,
     ) -> None:
         from unittest.mock import Mock
 
         from fastapi.testclient import TestClient
-        from starlette.types import Receive, Scope, Send
 
         from app.authentication.service import AuthenticationService
         from app.execution import InlineExecutor
@@ -1117,33 +1240,34 @@ class DocumentTests(unittest.TestCase):
                 authentication=authentication,
             )
         )
-        bodies: list[ImageBody] = []
-
-        async def native_host(scope: Scope, receive: Receive, send: Send) -> None:
-            if scope["type"] == "http":
-                scope.setdefault("extensions", {})["wright.native_image_stream"] = True
-            await application(scope, receive, send)
-            body = scope.get("state", {}).get("image_body")
-            if isinstance(body, ImageBody):
-                bodies.append(body)
-
-        with TestClient(native_host) as client:
-            response = client.get(f"/avatars/{self.owner.id}")
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.content, b"")
-            self.assertEqual(response.headers["content-length"], str(len(AVIF)))
-            self.assertEqual(response.headers["cache-control"], "public, max-age=300")
-            self.assertEqual(client.get(f"/images/{image}/content").status_code, 401)
-            response = client.get(
-                f"/images/{image}/content", headers={"Authorization": "Bearer test"}
+        heads, prefixes = self.images.heads[:], self.images.prefixes[:]
+        headers = {"Authorization": "Bearer test"}
+        with TestClient(application, follow_redirects=False) as client:
+            responses = (
+                client.get(f"/avatars/{self.owner.id}"),
+                client.get(f"/images/{image}/content", headers=headers),
             )
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.headers["cache-control"], "private, no-store")
-            self.assertEqual(response.headers["vary"], "Authorization")
-            self.assertEqual(len(bodies), 2)
-            for body in bodies:
-                self.assertEqual(next(body.chunks), AVIF)
-                body.close()
+            for response in responses:
+                self.assertEqual(response.status_code, 307)
+                self.assertEqual(response.content, b"")
+                url = urlsplit(response.headers["location"])
+                self.assertEqual(url.netloc, "account.r2.cloudflarestorage.com")
+                self.assertEqual(
+                    url.path, f"/wright-images/images/{self.owner.id}/{image}"
+                )
+                query = parse_qs(url.query)
+                self.assertEqual(query["X-Amz-Expires"], ["300"])
+                self.assertEqual(query["X-Amz-SignedHeaders"], ["host"])
+                self.assertEqual(len(query["X-Amz-Signature"][0]), 64)
+            self.assertEqual(responses[1].headers["vary"], "Authorization")
+            authentication.authenticate.return_value = Identity(
+                issuer=self.viewer.issuer, subject=self.viewer.subject
+            )
+            self.assertEqual(
+                client.get(f"/images/{image}/content", headers=headers).status_code, 404
+            )
+        self.assertEqual(self.images.heads, heads)
+        self.assertEqual(self.images.prefixes, prefixes)
 
 
 if __name__ == "__main__":

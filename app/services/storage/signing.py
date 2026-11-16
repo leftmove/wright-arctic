@@ -47,8 +47,21 @@ class S3Signer:
         media_type: str | None = None,
         now: datetime | None = None,
     ) -> Permission:
-        signed = self.request(key, seconds, method=method, size=size, sha256=sha256, media_type=media_type, now=now)
-        return Permission(method=method, url=signed.url, headers=signed.headers, expires_at=signed.expires_at)
+        signed = self.request(
+            key,
+            seconds,
+            method=method,
+            size=size,
+            sha256=sha256,
+            media_type=media_type,
+            now=now,
+        )
+        return Permission(
+            method=method,
+            url=signed.url,
+            headers=signed.headers,
+            expires_at=signed.expires_at,
+        )
 
     def request(
         self,

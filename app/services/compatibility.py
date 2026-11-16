@@ -1,24 +1,14 @@
 """Explicit legacy Worker/test ports. Native production never imports this module."""
 
-from collections.abc import AsyncIterator, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Sequence
 
 from app.execution import Executor
-from app.services.database import AsyncSession, Database, Row, Session
+from app.services.database import Database, Row
 from app.services.storage.objects import (
-    AsyncImageBody,
     CheckpointObjects,
     ImageObjects,
     ObjectMetadata,
 )
-
-
-class LegacySession:
-    def __init__(self, session: Session, executor: Executor) -> None:
-        self._session, self._executor = session, executor
-
-    async def execute(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
-        return await self._executor.run(self._session.execute, query, parameters)
 
 
 class LegacyDatabase:
@@ -31,14 +21,11 @@ class LegacyDatabase:
     async def close(self) -> None:
         await self.executor.run(self.database.close)
 
-    @asynccontextmanager
-    async def transaction(self) -> AsyncIterator[AsyncSession]:
-        # JSPI and fixtures use InlineExecutor. Threads must own a complete
-        # legacy transaction, so do not use this port for a native DB pool.
-        with self.database.transaction() as session:
-            yield LegacySession(session, self.executor)
+    async def fetch(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        return await self.executor.run(self.database.fetch, query, parameters)
 
-    read = transaction
+    async def write(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        return await self.executor.run(self.database.write, query, parameters)
 
 
 class LegacyCheckpoints:
@@ -59,17 +46,3 @@ class LegacyImages(LegacyCheckpoints):
 
     async def prefix(self, key: str, maximum: int) -> bytes:
         return await self.executor.run(self.images.prefix, key, maximum)
-
-    async def stream(self, key: str) -> AsyncImageBody:
-        body = await self.executor.run(self.images.stream, key)
-
-        async def chunks() -> AsyncIterator[bytes]:
-            while (
-                chunk := await self.executor.run(next, body.chunks, None)
-            ) is not None:
-                yield chunk
-
-        async def close() -> None:
-            await self.executor.run(body.close)
-
-        return AsyncImageBody(body.size, chunks(), close, body)

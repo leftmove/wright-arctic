@@ -1,8 +1,7 @@
 # Arctic Phase 1 storage contract
 
 Arctic coordinates opaque, complete checkpoint files. Only Pacific reads or writes
-the Yrs V2 + zstd document format. The server has no document codec, merge,
-projection, export, change-stream, or snapshot implementation.
+the Yrs V2 + zstd document format. The server treats document contents as opaque.
 
 ## Boundaries and ownership
 
@@ -77,10 +76,10 @@ internal account ID. `GET /spaces` includes the initial space;
 | Reserve an AVIF | `POST /images/uploads`: `id`, `size`, `hash`, `media_type: "image/avif"` |
 | Confirm uploaded image | `POST /images/{id}/confirm` |
 | List / deduplicate | `GET /images`, `GET /images/by-hash/{sha256}` |
-| Image metadata / bytes | `GET /images/{id}`, `GET /images/{id}/content` |
+| Image metadata / signed download redirect | `GET /images/{id}`, `GET /images/{id}/content` |
 | Delete unreferenced image | `DELETE /images/{id}` |
 | Select / clear avatar | `PUT /account/avatar`: `image_id` or null |
-| Public avatar bytes | `GET /avatars/{account}`; no authentication |
+| Public avatar signed download redirect | `GET /avatars/{account}` |
 
 An owner's grant is permanent for the lifetime of the document. Owners manage
 sharing and trash; editors can rename and publish; viewers only read. Images are
@@ -98,8 +97,10 @@ dimension cap. Confirmation performs a HEAD for size, type, and signed hash
 metadata, plus a range GET of at most 512 bytes to check the AVIF file-type box.
 This intentionally costs two Class B requests: trusting a supplied MIME type
 alone would accept a renamed GIF or JPEG XL file. Arctic performs no pixel
-decoding, encoding, or rendition generation. Delivery streams one GET through
-the authenticated API. Public avatars carry public cache headers.
+decoding, encoding, or rendition generation. Content and public avatar routes
+authorize access and issue a 307 redirect to a signed R2 GET. Redirects use
+`Cache-Control: private, no-store` so a later request checks the current grant
+or avatar selection.
 
 ## Sync protocol
 
@@ -164,24 +165,33 @@ cannot permanently resurrect a retired object.
 
 ## Request and database work
 
-`/ready` validates the full catalog, including in the deployment workflow.
-Deployments with a configured private database URL also validate it before
-activation. Database-backed Worker requests verify the runtime role once per
-request. Permission decisions continue
-to read current grants. Each transaction configures both SQL timeouts in one
-round trip and explicitly uses READ COMMITTED.
+`/ready` in the native process requires a full connection pool and a loaded
+catalog snapshot. The process opens the full pool at startup. Native Postgres
+reads use one autocommit statement. Each grouped write ships BEGIN, work, and
+COMMIT in one pipeline with READ COMMITTED isolation. The same pipeline reads
+the committed change log so the process applies its own writes before replying.
+Publication dispatches R2 HEADs between its preflight and commit phases.
 
-An eight-document reservation uses eleven domain SQL statements. Publication
-uses thirty, with bulk attempt reads, checkpoint bookkeeping, image-link
-insertion, and retention updates. Conditional pointer updates remain per
-document. Successful exact-key cleanup deletes are recorded together, with
-pending records preserved if the database commit fails.
+The native runtime URL uses a session pooler or direct Postgres connection on
+port 5432. It needs the additive migrations in the catalog ledger. One dedicated
+connection subscribes to `arctic_catalog_changes` before loading the snapshot.
+If needed, `WRIGHT_ARCTIC_DOCUMENTS_LISTENER_URL` supplies a restricted direct
+connection for that socket. Reads fall back to Postgres while the listener
+reconnects or applies changes it has been notified about.
+
+The container starts with `python -m app` and does not listen until that startup
+finishes. TCP keepalives and a pool check every 30 seconds replace sessions the
+platform or the pooler dropped while the instance was idle, without adding a
+round trip to a request. The server keeps HTTP connections open long enough for
+the load balancer to reuse them, and it returns its database sessions within the
+platform's stop window. Run one process per instance and set the service
+concurrency to the admission limit (16 by default). A transaction-mode pooler
+on port 6543 cannot serve this process.
 
 Hyperdrive sockets remain request-owned. The driver's bounded statement cache
 reuses prepared statements within that request. Hyperdrive query-result caching
-remains disabled. An isolated remote Worker check verified repeated statements
-across transactions, eight-document publication, and idempotent retries with
-statement caching enabled.
+remains disabled. The Worker verifies the runtime role once per request and
+executes the same grouped SQL operations in request-owned transactions.
 
 Domain services are created when used. The Worker caches immutable settings,
 bucket signers, and date-scoped SigV4 signing keys. Health requests and immediate
@@ -213,11 +223,8 @@ Requests are limited to 128,000 control bytes and eight document items. Image
 manifests and large libraries page within the same batch. Publication needs at
 most eight R2 HEADs plus eight immediate deletes. Each cleanup run uses at most
 sixteen sequential deletes. No checkpoint bytes enter Worker memory.
-The Worker uses one request-owned Hyperdrive socket and no server-side codecs.
-Image responses pass the authorized R2 ReadableStream directly to the host
-response. The ASGI routes still perform grants, UUID validation, and response
-header construction. This avoids copying image chunks through Python/Wasm,
-which can exceed the Free-plan CPU limit for a 2 MB image.
+The Worker uses one request-owned Hyperdrive socket. Object downloads go to R2
+after Arctic authorizes them.
 
 Workers Free allows 10 ms CPU, 128 MB memory, and 100,000 requests/day. The local
 dry-run checks the 64 MiB bundle bound. Hyperdrive has a 100,000-query daily

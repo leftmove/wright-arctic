@@ -1,11 +1,9 @@
 """In-memory object transports; PostgreSQL policy remains production code."""
 
-from collections.abc import Iterator
 from threading import Barrier
 
 from app.schemas import ImageUploadResponse, UploadSlot
 from app.services.storage.objects import (
-    ImageBody,
     ObjectMetadata,
     ObjectMissing,
     StorageUnavailable,
@@ -52,7 +50,6 @@ class Images(Checkpoints):
         super().__init__()
         self.bytes: dict[str, bytes] = {}
         self.prefixes: list[str] = []
-        self.reads: list[str] = []
 
     def upload_image(
         self, slot: ImageUploadResponse, data: bytes, *, media_type: str = "image/avif"
@@ -66,17 +63,6 @@ class Images(Checkpoints):
     def prefix(self, key: str, maximum: int) -> bytes:
         self.prefixes.append(key)
         return self.bytes[key][:maximum]
-
-    def stream(self, key: str) -> ImageBody:
-        self.reads.append(key)
-        if key not in self.objects:
-            raise ObjectMissing()
-        data = self.bytes[key]
-
-        def chunks() -> Iterator[bytes]:
-            yield data
-
-        return ImageBody(len(data), chunks(), lambda: None)
 
     def delete(self, key: str) -> None:
         super().delete(key)

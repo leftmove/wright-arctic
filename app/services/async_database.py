@@ -13,6 +13,7 @@ from app.services.database import (
     verify_catalog,
     verify_role,
 )
+from app.services.operations import check_rejection
 
 
 class Wait(Protocol):
@@ -83,22 +84,44 @@ class RequestPostgresDatabase:
             self._connection = None
         self._verified = False
 
+    def fetch(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        try:
+            return self._session(self._connect()).execute(query, parameters)
+        except (
+            self._driver.PostgresError,
+            self._driver.InterfaceError,
+            OSError,
+            TimeoutError,
+        ) as error:
+            raise_database_error(_sqlstate(error))
+
+    def write(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
+        with self.transaction() as session:
+            return session.execute(query, parameters)
+
+    def _connect(self) -> Connection:
+        if self._connection is None:
+            self._connection = self._wait(
+                self._driver.connect(self._url, timeout=5, statement_cache_size=100)
+            )
+        return self._connection
+
+    def _session(self, connection: Connection) -> AsyncPostgresSession:
+        session = AsyncPostgresSession(connection, self._wait)
+        if not self._verified:
+            verify_role(session)
+            self._verified = True
+        return session
+
     @contextmanager
     def transaction(self) -> Iterator[Session]:
         try:
-            if self._connection is None:
-                self._connection = self._wait(
-                    self._driver.connect(self._url, timeout=5, statement_cache_size=100)
-                )
-            transaction = self._connection.transaction(isolation="read_committed")
+            connection = self._connect()
+            transaction = connection.transaction(isolation="read_committed")
             self._wait(transaction.start())
             try:
-                session = AsyncPostgresSession(self._connection, self._wait)
-                self._wait(self._connection.execute(TRANSACTION_SETTINGS))
-                if not self._verified:
-                    verify_role(session)
-                    self._verified = True
-                yield session
+                self._wait(connection.execute(TRANSACTION_SETTINGS))
+                yield self._session(connection)
             except BaseException:
                 self._wait(transaction.rollback())
                 raise
@@ -110,5 +133,12 @@ class RequestPostgresDatabase:
             OSError,
             TimeoutError,
         ) as error:
-            state: object = getattr(error, "sqlstate", None)
-            raise_database_error(state if isinstance(state, str) else None)
+            state = _sqlstate(error)
+            detail: object = getattr(error, "detail", None)
+            check_rejection(state, detail if isinstance(detail, str) else None)
+            raise_database_error(state)
+
+
+def _sqlstate(error: Exception) -> str | None:
+    state: object = getattr(error, "sqlstate", None)
+    return state if isinstance(state, str) else None

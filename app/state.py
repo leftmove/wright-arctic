@@ -1,5 +1,6 @@
 """Explicit service ownership for process and Worker request lifetimes."""
 
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -9,6 +10,8 @@ from starlette.types import Scope
 from app.authentication.errors import AuthenticationUnavailable
 from app.authentication.service import AuthenticationService
 from app.execution import Executor
+from app.services.catalog.copy import CatalogCopy
+from app.services.catalog.reader import CatalogReader
 from app.services.cleanup import CleanupService
 from app.services.database import AsyncDatabase, Database
 from app.services.documents.service import DocumentService
@@ -34,17 +37,35 @@ class AppResources:
     database: AsyncDatabase | None = None
     storage: AsyncStorage | None = None
     probes_dependencies: bool = False
+    catalog: CatalogCopy | None = None
+    database_ready: Callable[[], bool] | None = field(
+        default=None, repr=False, compare=False
+    )
     _startup: _Startup = field(default_factory=_Startup, repr=False, compare=False)
 
     @cached_property
+    def catalog_reader(self) -> CatalogReader | None:
+        return (
+            CatalogReader(self.database, self.catalog)
+            if self.database is not None
+            else None
+        )
+
+    @cached_property
     def identity(self) -> IdentityService | None:
-        return IdentityService(self.database) if self.database is not None else None
+        return (
+            IdentityService(self.database, reader=self.catalog_reader)
+            if self.database is not None
+            else None
+        )
 
     @cached_property
     def documents(self) -> DocumentService | None:
         return (
             DocumentService(
-                self.database, trash_days=self.settings.trash_retention_days
+                self.database,
+                trash_days=self.settings.trash_retention_days,
+                reader=self.catalog_reader,
             )
             if self.database is not None
             else None
@@ -59,6 +80,7 @@ class AppResources:
             self.storage.checkpoints,
             self.storage.checkpoint_signer,
             presign_seconds=self.settings.storage_presign_seconds,
+            reader=self.catalog_reader,
         )
 
     @cached_property
@@ -70,6 +92,7 @@ class AppResources:
             self.storage.images,
             self.storage.image_signer,
             presign_seconds=self.settings.storage_presign_seconds,
+            reader=self.catalog_reader,
             daily_quota=self.settings.image_daily_quota,
             total_quota=self.settings.image_total_quota,
         )
@@ -93,6 +116,7 @@ class AppResources:
             return
         if (
             not self._startup.ready
+            or (self.database_ready is not None and not self.database_ready())
             or self.database is None
             or self.storage is None
             or self.authentication is None

@@ -27,7 +27,7 @@ class Space(Record):
     created_at: AwareDatetime
 
 
-class Document(Record):
+class DocumentRow(Record):
     id: UUID7
     space: UUID7
     title: str
@@ -37,6 +37,12 @@ class Document(Record):
     published_at: AwareDatetime | None
     created_at: AwareDatetime
     updated_at: AwareDatetime
+
+    def with_role(self, role: Role) -> Document:
+        return Document.model_validate({**self.model_dump(), "role": role})
+
+
+class Document(DocumentRow):
     role: Role
 
 
