@@ -1,6 +1,6 @@
-FROM python:3.14.8-slim-bookworm@sha256:ddec44f5ab04dd68aaee83d7dc9831c964a4bb9e950c89960e60760373fbf54f AS build
+FROM python:3.14.8-slim-bookworm AS build
 
-COPY --from=ghcr.io/astral-sh/uv:0.13.1@sha256:9a853e40f2eb00f980d265a84fba919dc38ff17750197e7f13c055e4e2f12edd /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /usr/local/bin/uv
 
 ENV UV_PYTHON=/usr/local/bin/python3 \
     UV_PYTHON_DOWNLOADS=never \
@@ -27,14 +27,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY engine ./engine
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=cache,target=/usr/local/rustup \
-    --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/var/cache/cargo-target \
-    uv sync --locked --no-dev --no-editable --python /usr/local/bin/python3
+RUN uv sync --locked --no-dev --no-editable --python /usr/local/bin/python3
 
-FROM python:3.14.8-slim-bookworm@sha256:ddec44f5ab04dd68aaee83d7dc9831c964a4bb9e950c89960e60760373fbf54f
+FROM python:3.14.8-slim-bookworm
 
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin app
