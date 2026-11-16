@@ -13,6 +13,7 @@ from app.schemas import (
     GrantDocument,
     RenameDocument,
 )
+from app.services.pagination import decode_cursor, encode_cursor
 
 router = APIRouter(prefix="/documents", tags=["metadata"])
 
@@ -30,18 +31,24 @@ async def create_document(
 async def list_documents(
     account: AccountDep,
     request: Request,
+    response: Response,
     trashed: bool = False,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    cursor: Annotated[str | None, Query(max_length=256)] = None,
 ) -> list[DocumentSummary]:
-    return await execute(
+    documents = await execute(
         request,
         require_document_service(request).list_documents,
         account,
         trashed=trashed,
         limit=limit,
         offset=offset,
+        cursor=decode_cursor(cursor, offset=offset),
     )
+    if len(documents) == limit:
+        response.headers["X-Next-Cursor"] = encode_cursor(documents[-1].updated_at, documents[-1].id)
+    return documents
 
 
 @router.get("/{document_id}")

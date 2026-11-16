@@ -12,6 +12,7 @@ from app.accounts import Identity
 from app.authentication.errors import AuthenticationUnavailable, InvalidCredentials
 from app.authentication.jwks import SigningKeys
 from app.authentication.models import AccessClaims, TokenHeader
+from app.observability import span
 from app.settings import Settings
 
 # Reject malformed/oversized compact JWTs before JSON parsing or any key fetch.
@@ -59,8 +60,9 @@ class AuthenticationService:
             header = TokenHeader.model_validate(jwt.get_unverified_header(token))
             if header.alg != self._algorithm:
                 raise InvalidCredentials()
-            key = await self._keys.get(header.kid, client=self._client)
-            await key.verify(token)
+            with span("jwt.keys_and_signature"):
+                key = await self._keys.get(header.kid, client=self._client)
+                await key.verify(token)
             claims = AccessClaims.model_validate(
                 jwt.decode(
                     token,
@@ -106,7 +108,8 @@ class AuthenticationService:
             and methods.intersection({"totp", "mfa/totp"})
         ):
             raise InvalidCredentials()
-        await self._check_policy(token)
+        with span("policy.http"):
+            await self._check_policy(token)
         return Identity(subject=claims.sub, issuer=claims.iss)
 
     async def _check_policy(self, token: str) -> None:

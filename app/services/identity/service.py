@@ -1,11 +1,12 @@
 """Map provider identities to UUIDv7 accounts without depending on provider IDs."""
 
-from uuid import UUID, uuid7
+from uuid import UUID
 
 from app.accounts import Identity
 from app.schemas import AccountResponse
-from app.services.database import Database
+from app.services.database import AsyncDatabase as Database
 from app.services.errors import NotFound
+from app.services.identity.actor import Actor, resolve_actor, resolve_identity
 from app.services.models import Account
 
 
@@ -22,53 +23,39 @@ class IdentityService:
     def __init__(self, database: Database) -> None:
         self._database = database
 
-    def resolve(self, identity: Identity) -> Account:
-        with self._database.transaction() as session:
-            rows = session.execute(
-                "select * from public.accounts where issuer=%s and subject=%s",
-                (identity.issuer, identity.subject),
-            )
-            if rows:
-                return Account.model_validate(rows[0])
-            rows = session.execute(
-                """insert into public.accounts(id,issuer,subject) values(%s,%s,%s)
-                    on conflict(issuer,subject) do nothing returning *""",
-                (uuid7(), identity.issuer, identity.subject),
-            )
-            if rows:
-                account = Account.model_validate(rows[0])
-                session.execute(
-                    "insert into documents.spaces(id,owner) values(%s,%s)",
-                    (uuid7(), account.id),
-                )
-                return account
-            return Account.model_validate(
-                session.execute(
-                    "select * from public.accounts where issuer=%s and subject=%s",
-                    (identity.issuer, identity.subject),
-                )[0]
-            )
+    async def resolve(self, identity: Identity) -> Account:
+        async with self._database.read() as session:
+            return await resolve_identity(session, identity)
 
-    def current(self, account: Account) -> AccountResponse:
-        with self._database.transaction() as session:
-            rows = session.execute(
+    async def current(self, account: Actor) -> AccountResponse:
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            rows = await session.execute(
                 "select * from public.accounts where id=%s", (account.id,)
             )
             if not rows:
                 raise NotFound()
             return account_response(Account.model_validate(rows[0]))
 
-    def select_avatar(self, account: Account, image_id: UUID | None) -> AccountResponse:
-        with self._database.transaction() as session:
-            session.execute(
-                "select id from public.accounts where id=%s for update", (account.id,)
+    async def select_avatar(
+        self, account: Actor, image_id: UUID | None
+    ) -> AccountResponse:
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            (
+                await session.execute(
+                    "select id from public.accounts where id=%s for update",
+                    (account.id,),
+                )
             )
-            if image_id is not None and not session.execute(
-                "select id from public.images where id=%s and account=%s and deleted_at is null for share",
-                (image_id, account.id),
+            if image_id is not None and not (
+                await session.execute(
+                    "select id from public.images where id=%s and account=%s and deleted_at is null for share",
+                    (image_id, account.id),
+                )
             ):
                 raise NotFound()
-            rows = session.execute(
+            rows = await session.execute(
                 "update public.accounts set avatar_id=%s where id=%s returning *",
                 (image_id, account.id),
             )

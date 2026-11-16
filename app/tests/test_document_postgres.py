@@ -36,6 +36,7 @@ from app.services.identity.service import IdentityService
 from app.services.models import Account
 from app.services.storage.signing import S3Signer
 from app.services.sync.service import SyncService
+from app.tests import async_support
 from app.tests.image_storage import Checkpoints
 
 
@@ -75,21 +76,32 @@ class PostgresConcurrencyTests(unittest.TestCase):
         self.database.open()
         self.accounts: list[UUID] = []
         self.addCleanup(self.remove_records)
-        identity = IdentityService(self.database)
-        self.owner = identity.resolve(
-            Identity(issuer="https://postgres-test.invalid", subject=str(uuid7()))
+        identity = IdentityService(async_support.database(self.database))
+        self.owner = async_support.run(
+            identity.resolve(
+                Identity(issuer="https://postgres-test.invalid", subject=str(uuid7()))
+            )
         )
         self.accounts.append(self.owner.id)
-        self.editor = identity.resolve(
-            Identity(issuer="https://postgres-test.invalid", subject=str(uuid7()))
+        self.editor = async_support.run(
+            identity.resolve(
+                Identity(issuer="https://postgres-test.invalid", subject=str(uuid7()))
+            )
         )
         self.accounts.append(self.editor.id)
-        self.documents = DocumentService(self.database)
-        self.document = self.documents.create(
-            self.owner,
-            CreateDocument(id=uuid7(), space=self.documents.spaces(self.owner)[0].id),
+        self.documents = DocumentService(async_support.database(self.database))
+        self.document = async_support.run(
+            self.documents.create(
+                self.owner,
+                CreateDocument(
+                    id=uuid7(),
+                    space=async_support.run(self.documents.spaces(self.owner))[0].id,
+                ),
+            )
         )
-        self.documents.grant(self.owner, self.document.id, self.editor.id, "editor")
+        async_support.run(
+            self.documents.grant(self.owner, self.document.id, self.editor.id, "editor")
+        )
         self.objects = Checkpoints()
         self.signer = S3Signer(
             "https://test.r2.cloudflarestorage.com",
@@ -98,7 +110,11 @@ class PostgresConcurrencyTests(unittest.TestCase):
             "access",
             "secret",
         )
-        self.sync = SyncService(self.database, self.objects, self.signer)
+        self.sync = SyncService(
+            async_support.database(self.database),
+            async_support.checkpoints(self.objects),
+            self.signer,
+        )
 
     def remove_records(self) -> None:
         ids = self.accounts
@@ -123,16 +139,18 @@ class PostgresConcurrencyTests(unittest.TestCase):
             )
 
     def issue(self, account: Account) -> tuple[UUID, UploadSlot]:
-        batch = self.sync.start(
-            account,
-            StartBatch(
-                id=uuid7(),
-                documents=[
-                    CheckpointUpload(
-                        document_id=self.document.id, size=10, hash="a" * 64
-                    )
-                ],
-            ),
+        batch = async_support.run(
+            self.sync.start(
+                account,
+                StartBatch(
+                    id=uuid7(),
+                    documents=[
+                        CheckpointUpload(
+                            document_id=self.document.id, size=10, hash="a" * 64
+                        )
+                    ],
+                ),
+            )
         )
         slot = batch.documents[0]
         self.objects.upload(slot)
@@ -156,10 +174,14 @@ class PostgresConcurrencyTests(unittest.TestCase):
         self.objects.barrier = Barrier(2)
         with ThreadPoolExecutor(max_workers=2) as pool:
             owner = pool.submit(
-                self.sync.publish, self.owner, owner_batch, self.command(first)
+                lambda: async_support.run(
+                    self.sync.publish(self.owner, owner_batch, self.command(first))
+                )
             )
             editor = pool.submit(
-                self.sync.publish, self.editor, editor_batch, self.command(second)
+                lambda: async_support.run(
+                    self.sync.publish(self.editor, editor_batch, self.command(second))
+                )
             )
             results = [owner.result(timeout=15), editor.result(timeout=15)]
         self.objects.barrier = None
@@ -182,7 +204,11 @@ class PostgresConcurrencyTests(unittest.TestCase):
             ThreadPoolExecutor(max_workers=1) as pool,
         ):
             database = ConnectionDatabase(publisher)
-            service = SyncService(database, self.objects, self.signer)
+            service = SyncService(
+                async_support.database(database),
+                async_support.checkpoints(self.objects),
+                self.signer,
+            )
             with revoker.transaction():
                 session = PostgresSession(revoker)
                 session.execute(
@@ -194,7 +220,9 @@ class PostgresConcurrencyTests(unittest.TestCase):
                     (self.document.id, self.editor.id),
                 )
                 future = pool.submit(
-                    service.publish, self.editor, batch, self.command(slot)
+                    lambda: async_support.run(
+                        service.publish(self.editor, batch, self.command(slot))
+                    )
                 )
                 deadline = time.monotonic() + 3
                 waiting = False
@@ -211,7 +239,11 @@ class PostgresConcurrencyTests(unittest.TestCase):
                 self.assertTrue(waiting, "Publisher did not reach the document lock")
             result = future.result(timeout=10)
         self.assertEqual(result.documents[0].result, "forbidden")
-        self.assertIsNone(self.sync.open(self.owner, self.document.id, None).revision)
+        self.assertIsNone(
+            async_support.run(
+                self.sync.open(self.owner, self.document.id, None)
+            ).revision
+        )
         self.assertNotIn(slot.key, self.objects.objects)
 
     def test_publish_rechecks_checkpoint_state_after_cleanup_commits(self) -> None:
@@ -226,7 +258,11 @@ class PostgresConcurrencyTests(unittest.TestCase):
             ThreadPoolExecutor(max_workers=1) as pool,
         ):
             database = ConnectionDatabase(publisher)
-            service = SyncService(database, self.objects, self.signer)
+            service = SyncService(
+                async_support.database(database),
+                async_support.checkpoints(self.objects),
+                self.signer,
+            )
             with cleaner.transaction():
                 session = PostgresSession(cleaner)
                 session.execute(
@@ -235,7 +271,9 @@ class PostgresConcurrencyTests(unittest.TestCase):
                     (slot.document_id, slot.revision),
                 )
                 future = pool.submit(
-                    service.publish, self.owner, batch, self.command(slot)
+                    lambda: async_support.run(
+                        service.publish(self.owner, batch, self.command(slot))
+                    )
                 )
                 deadline = time.monotonic() + 3
                 waiting = False
@@ -252,5 +290,9 @@ class PostgresConcurrencyTests(unittest.TestCase):
                 self.assertTrue(waiting, "Publisher did not reach the checkpoint lock")
             result = future.result(timeout=10)
         self.assertEqual(result.documents[0].result, "expired")
-        self.assertIsNone(self.sync.open(self.owner, self.document.id, None).revision)
+        self.assertIsNone(
+            async_support.run(
+                self.sync.open(self.owner, self.document.id, None)
+            ).revision
+        )
         self.assertNotIn(slot.key, self.objects.objects)

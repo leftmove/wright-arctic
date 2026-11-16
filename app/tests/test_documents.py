@@ -32,6 +32,7 @@ from app.services.storage.factory import Storage
 from app.services.storage.objects import ImageBody, ObjectMetadata
 from app.services.storage.signing import S3Signer
 from app.services.sync.service import Attempt, SyncService
+from app.tests import async_support
 from app.tests.document_database import FixtureDatabase
 from app.tests.image_storage import Checkpoints, Images
 
@@ -43,23 +44,35 @@ class DocumentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.db = FixtureDatabase()
         self.addCleanup(self.db.close)
-        self.identity = IdentityService(self.db)
-        self.owner = self.identity.resolve(
-            Identity(issuer="https://issuer.example", subject="provider-user")
+        self.identity = IdentityService(async_support.database(self.db))
+        self.owner = async_support.run(
+            self.identity.resolve(
+                Identity(issuer="https://issuer.example", subject="provider-user")
+            )
         )
-        self.editor = self.identity.resolve(
-            Identity(issuer="https://issuer.example", subject="editor")
+        self.editor = async_support.run(
+            self.identity.resolve(
+                Identity(issuer="https://issuer.example", subject="editor")
+            )
         )
-        self.viewer = self.identity.resolve(
-            Identity(issuer="https://issuer.example", subject="viewer")
+        self.viewer = async_support.run(
+            self.identity.resolve(
+                Identity(issuer="https://issuer.example", subject="viewer")
+            )
         )
-        self.documents = DocumentService(self.db)
-        self.space = self.documents.spaces(self.owner)[0].id
-        self.document = self.documents.create(
-            self.owner, CreateDocument(id=uuid7(), space=self.space)
+        self.documents = DocumentService(async_support.database(self.db))
+        self.space = async_support.run(self.documents.spaces(self.owner))[0].id
+        self.document = async_support.run(
+            self.documents.create(
+                self.owner, CreateDocument(id=uuid7(), space=self.space)
+            )
         )
-        self.documents.grant(self.owner, self.document.id, self.editor.id, "editor")
-        self.documents.grant(self.owner, self.document.id, self.viewer.id, "viewer")
+        async_support.run(
+            self.documents.grant(self.owner, self.document.id, self.editor.id, "editor")
+        )
+        async_support.run(
+            self.documents.grant(self.owner, self.document.id, self.viewer.id, "viewer")
+        )
         self.checkpoints = Checkpoints()
         self.images = Images()
         self.signer = S3Signer(
@@ -79,9 +92,19 @@ class DocumentTests(unittest.TestCase):
         self.storage = Storage(
             self.checkpoints, self.signer, self.images, self.image_signer
         )
-        self.sync = SyncService(self.db, self.checkpoints, self.signer)
-        self.media = ImageService(self.db, self.images, self.image_signer)
-        self.cleanup = CleanupService(self.db, self.storage)
+        self.sync = SyncService(
+            async_support.database(self.db),
+            async_support.checkpoints(self.checkpoints),
+            self.signer,
+        )
+        self.media = ImageService(
+            async_support.database(self.db),
+            async_support.images(self.images),
+            self.image_signer,
+        )
+        self.cleanup = CleanupService(
+            async_support.database(self.db), async_support.storage(self.storage)
+        )
 
     def start(
         self,
@@ -90,16 +113,20 @@ class DocumentTests(unittest.TestCase):
         *,
         size: int = 10,
     ) -> tuple[UUID, UploadSlot]:
-        batch = self.sync.start(
-            account or self.owner,
-            StartBatch(
-                id=uuid7(),
-                documents=[
-                    CheckpointUpload(
-                        document_id=document or self.document.id, size=size, hash=DIGEST
-                    )
-                ],
-            ),
+        batch = async_support.run(
+            self.sync.start(
+                account or self.owner,
+                StartBatch(
+                    id=uuid7(),
+                    documents=[
+                        CheckpointUpload(
+                            document_id=document or self.document.id,
+                            size=size,
+                            hash=DIGEST,
+                        )
+                    ],
+                ),
+            )
         )
         return batch.id, batch.documents[0]
 
@@ -111,20 +138,22 @@ class DocumentTests(unittest.TestCase):
         images: list[UUID] | None = None,
     ) -> str:
         return (
-            self.sync.publish(
-                account or self.owner,
-                batch,
-                PublishBatch(
-                    documents=[
-                        PublishItem(
-                            document_id=slot.document_id,
-                            base_revision=slot.base_revision,
-                            revision=slot.revision,
-                            key=slot.key,
-                            images=images or [],
-                        )
-                    ]
-                ),
+            async_support.run(
+                self.sync.publish(
+                    account or self.owner,
+                    batch,
+                    PublishBatch(
+                        documents=[
+                            PublishItem(
+                                document_id=slot.document_id,
+                                base_revision=slot.base_revision,
+                                revision=slot.revision,
+                                key=slot.key,
+                                images=images or [],
+                            )
+                        ]
+                    ),
+                )
             )
             .documents[0]
             .result
@@ -139,27 +168,33 @@ class DocumentTests(unittest.TestCase):
 
     def image(self, account: Account | None = None, data: bytes = AVIF) -> UUID:
         account = account or self.owner
-        slot = self.media.issue(
-            account,
-            IssueImage(
-                id=uuid7(), size=len(data), hash=hashlib.sha256(data).hexdigest()
-            ),
+        slot = async_support.run(
+            self.media.issue(
+                account,
+                IssueImage(
+                    id=uuid7(), size=len(data), hash=hashlib.sha256(data).hexdigest()
+                ),
+            )
         )
         self.images.upload_image(slot, data)
-        return self.media.confirm(account, slot.id).id
+        return async_support.run(self.media.confirm(account, slot.id)).id
 
     def test_uuid7_identity_is_issuer_scoped_and_default_space_is_atomic(self) -> None:
-        same = self.identity.resolve(
-            Identity(issuer=self.owner.issuer, subject=self.owner.subject)
+        same = async_support.run(
+            self.identity.resolve(
+                Identity(issuer=self.owner.issuer, subject=self.owner.subject)
+            )
         )
-        other = self.identity.resolve(
-            Identity(issuer="https://another.example", subject=self.owner.subject)
+        other = async_support.run(
+            self.identity.resolve(
+                Identity(issuer="https://another.example", subject=self.owner.subject)
+            )
         )
         self.assertEqual(same.id, self.owner.id)
         self.assertNotEqual(same.id, other.id)
         self.assertEqual(self.owner.id.version, 7)
         self.assertEqual(self.space.version, 7)
-        self.assertEqual(len(self.documents.spaces(self.owner)), 1)
+        self.assertEqual(len(async_support.run(self.documents.spaces(self.owner))), 1)
         verify_runtime(self.db)
         with self.assertRaises(ValidationError):
             CreateDocument(id=uuid4(), space=self.space)
@@ -197,18 +232,22 @@ class DocumentTests(unittest.TestCase):
                 CheckpointUpload(document_id=self.document.id, size=10, hash=DIGEST)
             ],
         )
-        first = self.sync.start(self.owner, command)
-        start = self.identity.current(self.owner).last_sync
-        second = self.sync.start(self.owner, command)
+        first = async_support.run(self.sync.start(self.owner, command))
+        start = async_support.run(self.identity.current(self.owner)).last_sync
+        second = async_support.run(self.sync.start(self.owner, command))
         self.assertEqual(first.documents[0].revision, second.documents[0].revision)
-        self.assertEqual(start, self.identity.current(self.owner).last_sync)
+        self.assertEqual(
+            start, async_support.run(self.identity.current(self.owner)).last_sync
+        )
         with self.assertRaises(ServiceError) as failure:
             self.start()
         self.assertEqual(failure.exception.code, "sync_window")
         self.assertIn("Retry-After", failure.exception.headers)
         with self.assertRaises(Forbidden):
             self.start(self.viewer)
-        self.assertIsNone(self.identity.current(self.viewer).last_sync)
+        self.assertIsNone(
+            async_support.run(self.identity.current(self.viewer)).last_sync
+        )
 
     def test_eight_document_slots_are_batched_and_retry_identically(self) -> None:
         from unittest.mock import patch
@@ -216,8 +255,10 @@ class DocumentTests(unittest.TestCase):
         documents = [
             self.document,
             *[
-                self.documents.create(
-                    self.owner, CreateDocument(id=uuid7(), space=self.space)
+                async_support.run(
+                    self.documents.create(
+                        self.owner, CreateDocument(id=uuid7(), space=self.space)
+                    )
                 )
                 for _ in range(7)
             ],
@@ -232,7 +273,7 @@ class DocumentTests(unittest.TestCase):
             ],
         )
         with patch.object(self.db, "execute", wraps=self.db.execute) as execute:
-            batch = self.sync.start(self.owner, command)
+            batch = async_support.run(self.sync.start(self.owner, command))
         self.assertLessEqual(execute.call_count, 14)
         self.assertEqual(
             [slot.document_id for slot in batch.documents],
@@ -250,7 +291,7 @@ class DocumentTests(unittest.TestCase):
             )
             self.assertEqual(stored[item.document_id]["size"], item.size)
             self.assertEqual(stored[item.document_id]["hash"], item.hash)
-        again = self.sync.start(self.owner, command)
+        again = async_support.run(self.sync.start(self.owner, command))
         self.assertEqual(
             [slot.revision for slot in again.documents],
             [slot.revision for slot in batch.documents],
@@ -261,8 +302,10 @@ class DocumentTests(unittest.TestCase):
         documents = [
             self.document,
             *[
-                self.documents.create(
-                    self.owner, CreateDocument(id=uuid7(), space=self.space)
+                async_support.run(
+                    self.documents.create(
+                        self.owner, CreateDocument(id=uuid7(), space=self.space)
+                    )
                 )
                 for _ in range(7)
             ],
@@ -276,30 +319,38 @@ class DocumentTests(unittest.TestCase):
         )
         self.db.fail_commit = True
         with self.assertRaises(Unavailable):
-            self.sync.start(self.owner, command)
+            async_support.run(self.sync.start(self.owner, command))
         with self.db.transaction() as session:
             self.assertEqual(session.execute("select * from documents.checkpoints"), [])
             self.assertEqual(session.execute("select * from coordination.batches"), [])
-        self.assertIsNone(self.identity.current(self.owner).last_sync)
-        self.assertEqual(len(self.sync.start(self.owner, command).documents), 8)
+        self.assertIsNone(
+            async_support.run(self.identity.current(self.owner)).last_sync
+        )
+        self.assertEqual(
+            len(async_support.run(self.sync.start(self.owner, command)).documents), 8
+        )
 
     def test_batched_publish_keeps_each_result_and_image_link(self) -> None:
         documents = [
-            self.documents.create(
-                self.owner, CreateDocument(id=uuid7(), space=self.space)
+            async_support.run(
+                self.documents.create(
+                    self.owner, CreateDocument(id=uuid7(), space=self.space)
+                )
             )
             for _ in range(8)
         ]
         image = self.image()
-        batch = self.sync.start(
-            self.owner,
-            StartBatch(
-                id=uuid7(),
-                documents=[
-                    CheckpointUpload(document_id=document.id, size=10, hash=DIGEST)
-                    for document in reversed(documents)
-                ],
-            ),
+        batch = async_support.run(
+            self.sync.start(
+                self.owner,
+                StartBatch(
+                    id=uuid7(),
+                    documents=[
+                        CheckpointUpload(document_id=document.id, size=10, hash=DIGEST)
+                        for document in reversed(documents)
+                    ],
+                ),
+            )
         )
         for slot in batch.documents[2:]:
             self.checkpoints.upload(slot)
@@ -315,7 +366,7 @@ class DocumentTests(unittest.TestCase):
                 for slot in batch.documents
             ]
         )
-        result = self.sync.publish(self.owner, batch.id, command)
+        result = async_support.run(self.sync.publish(self.owner, batch.id, command))
         self.assertEqual(
             [item.document_id for item in result.documents],
             [slot.document_id for slot in batch.documents],
@@ -326,7 +377,9 @@ class DocumentTests(unittest.TestCase):
         )
         self.assertFalse(result.cleanup_pending)
         reads = len(self.checkpoints.heads)
-        self.assertEqual(self.sync.publish(self.owner, batch.id, command), result)
+        self.assertEqual(
+            async_support.run(self.sync.publish(self.owner, batch.id, command)), result
+        )
         self.assertEqual(len(self.checkpoints.heads), reads)
         with self.db.transaction() as session:
             linked = session.execute(
@@ -354,35 +407,43 @@ class DocumentTests(unittest.TestCase):
         self,
     ) -> None:
         batch, first = self.start()
-        next_document = self.documents.create(
-            self.owner, CreateDocument(id=uuid7(), space=self.space)
+        next_document = async_support.run(
+            self.documents.create(
+                self.owner, CreateDocument(id=uuid7(), space=self.space)
+            )
         )
-        extended = self.sync.start(
-            self.owner,
-            StartBatch(
-                id=batch,
-                documents=[
-                    CheckpointUpload(document_id=next_document.id, size=20, hash=DIGEST)
-                ],
-            ),
+        extended = async_support.run(
+            self.sync.start(
+                self.owner,
+                StartBatch(
+                    id=batch,
+                    documents=[
+                        CheckpointUpload(
+                            document_id=next_document.id, size=20, hash=DIGEST
+                        )
+                    ],
+                ),
+            )
         )
         self.assertEqual(extended.id, batch)
         self.checkpoints.upload(first)
         self.checkpoints.upload(extended.documents[0])
-        result = self.sync.publish(
-            self.owner,
-            batch,
-            PublishBatch(
-                documents=[
-                    PublishItem(
-                        document_id=slot.document_id,
-                        base_revision=slot.base_revision,
-                        revision=slot.revision,
-                        key=slot.key,
-                    )
-                    for slot in [first, *extended.documents]
-                ]
-            ),
+        result = async_support.run(
+            self.sync.publish(
+                self.owner,
+                batch,
+                PublishBatch(
+                    documents=[
+                        PublishItem(
+                            document_id=slot.document_id,
+                            base_revision=slot.base_revision,
+                            revision=slot.revision,
+                            key=slot.key,
+                        )
+                        for slot in [first, *extended.documents]
+                    ]
+                ),
+            )
         )
         self.assertEqual(
             [item.result for item in result.documents], ["published", "published"]
@@ -395,10 +456,12 @@ class DocumentTests(unittest.TestCase):
         self.checkpoints.upload(slot)
         self.assertEqual(self.publish(batch, slot), "published")
         count = len(self.checkpoints.heads)
-        pointer = self.sync.open(self.viewer, self.document.id, slot.revision)
+        pointer = async_support.run(
+            self.sync.open(self.viewer, self.document.id, slot.revision)
+        )
         self.assertIsNone(pointer.read)
         self.assertEqual(len(self.checkpoints.heads), count)
-        changed = self.sync.open(self.viewer, self.document.id, None)
+        changed = async_support.run(self.sync.open(self.viewer, self.document.id, None))
         self.assertIsNotNone(changed.read)
         self.assertEqual(
             changed.key, f"documents/{self.space}/{self.document.id}/{slot.revision}"
@@ -425,7 +488,10 @@ class DocumentTests(unittest.TestCase):
         self.assertIn(loser.key, self.checkpoints.deleted)
         self.assertNotIn(loser.key, self.checkpoints.objects)
         self.assertEqual(
-            self.sync.open(self.owner, self.document.id, None).revision, winner.revision
+            async_support.run(
+                self.sync.open(self.owner, self.document.id, None)
+            ).revision,
+            winner.revision,
         )
 
     def test_retention_keeps_three_and_retired_publish_retry_still_succeeds(
@@ -441,11 +507,15 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(len(self.checkpoints.objects), 3)
         self.assertIn(saved[0][1].key, self.checkpoints.deleted)
         self.assertEqual(self.publish(*saved[0]), "published")
-        pointer = self.sync.open(self.owner, self.document.id, saved[0][1].revision)
+        pointer = async_support.run(
+            self.sync.open(self.owner, self.document.id, saved[0][1].revision)
+        )
         self.assertEqual(pointer.revision, saved[-1][1].revision)
         self.assertIsNotNone(pointer.read)
         reads = len(self.checkpoints.heads)
-        retained = self.sync.checkpoints(self.viewer, self.document.id)
+        retained = async_support.run(
+            self.sync.checkpoints(self.viewer, self.document.id)
+        )
         self.assertEqual(
             [value.revision for value in retained],
             [slot.revision for _, slot in reversed(saved[1:])],
@@ -456,29 +526,33 @@ class DocumentTests(unittest.TestCase):
     def test_failed_delete_remains_pending_and_cron_retries_it(self) -> None:
         batch, slot = self.start()
         self.checkpoints.upload(slot)
-        self.documents.grant(self.owner, self.document.id, self.editor.id, None)
+        async_support.run(
+            self.documents.grant(self.owner, self.document.id, self.editor.id, None)
+        )
         self.checkpoints.objects[slot.key] = ObjectMetadata(
             MAX_CHECKPOINT_BYTES + 1, "application/octet-stream", {"sha256": DIGEST}
         )
         self.checkpoints.fail_delete = True
-        response = self.sync.publish(
-            self.owner,
-            batch,
-            PublishBatch(
-                documents=[
-                    PublishItem(
-                        document_id=slot.document_id,
-                        base_revision=slot.base_revision,
-                        revision=slot.revision,
-                        key=slot.key,
-                    )
-                ]
-            ),
+        response = async_support.run(
+            self.sync.publish(
+                self.owner,
+                batch,
+                PublishBatch(
+                    documents=[
+                        PublishItem(
+                            document_id=slot.document_id,
+                            base_revision=slot.base_revision,
+                            revision=slot.revision,
+                            key=slot.key,
+                        )
+                    ]
+                ),
+            )
         )
         self.assertTrue(response.cleanup_pending)
         self.assertEqual(response.documents[0].result, "invalid")
         self.checkpoints.fail_delete = False
-        result = self.cleanup.run()
+        result = async_support.run(self.cleanup.run())
         self.assertEqual(result.checkpoints, 1)
         self.assertNotIn(slot.key, self.checkpoints.objects)
 
@@ -496,29 +570,31 @@ class DocumentTests(unittest.TestCase):
             return original(query, parameters)
 
         with patch.object(self.db, "execute", side_effect=fail_delete_recording):
-            result = self.sync.publish(
-                self.owner,
-                batch,
-                PublishBatch(
-                    documents=[
-                        PublishItem(
-                            document_id=slot.document_id,
-                            base_revision=slot.base_revision,
-                            revision=slot.revision,
-                            key=slot.key,
-                        )
-                    ]
-                ),
+            result = async_support.run(
+                self.sync.publish(
+                    self.owner,
+                    batch,
+                    PublishBatch(
+                        documents=[
+                            PublishItem(
+                                document_id=slot.document_id,
+                                base_revision=slot.base_revision,
+                                revision=slot.revision,
+                                key=slot.key,
+                            )
+                        ]
+                    ),
+                )
             )
             self.assertTrue(result.cleanup_pending)
-            cleanup = self.cleanup.run()
+            cleanup = async_support.run(self.cleanup.run())
             self.assertEqual((cleanup.checkpoints, cleanup.failures), (0, 1))
         with self.db.transaction() as session:
             self.assertEqual(
                 session.execute("select state from documents.checkpoints"),
                 [{"state": "pending"}],
             )
-        self.assertEqual(self.cleanup.run().checkpoints, 1)
+        self.assertEqual(async_support.run(self.cleanup.run()).checkpoints, 1)
 
     def test_pointer_and_image_links_roll_back_when_commit_fails(self) -> None:
         image = self.image()
@@ -527,8 +603,8 @@ class DocumentTests(unittest.TestCase):
         # Fail the second transaction: the preflight does no mutations.
         original = self.sync._uploaded
 
-        def fail_at_commit(attempt: Attempt) -> bool:
-            result = original(attempt)
+        async def fail_at_commit(attempt: Attempt) -> bool:
+            result = await original(attempt)
             self.db.fail_commit = True
             return result
 
@@ -539,7 +615,11 @@ class DocumentTests(unittest.TestCase):
             self.assertRaises(Unavailable),
         ):
             self.publish(batch, slot, images=[image])
-        self.assertIsNone(self.sync.open(self.owner, self.document.id, None).revision)
+        self.assertIsNone(
+            async_support.run(
+                self.sync.open(self.owner, self.document.id, None)
+            ).revision
+        )
         with self.db.transaction() as session:
             self.assertEqual(session.execute("select * from documents.images"), [])
         self.assertIn(slot.key, self.checkpoints.objects)
@@ -547,21 +627,25 @@ class DocumentTests(unittest.TestCase):
     def test_revocation_refuses_upload_and_read_without_content_access(self) -> None:
         batch, slot = self.start(self.editor)
         self.checkpoints.upload(slot)
-        self.documents.grant(self.owner, self.document.id, self.editor.id, None)
+        async_support.run(
+            self.documents.grant(self.owner, self.document.id, self.editor.id, None)
+        )
         self.assertEqual(self.publish(batch, slot, self.editor), "forbidden")
         self.assertEqual(self.checkpoints.heads, [])
         self.assertIn(slot.key, self.checkpoints.deleted)
         with self.assertRaises(NotFound):
-            self.sync.open(self.editor, self.document.id, None)
+            async_support.run(self.sync.open(self.editor, self.document.id, None))
 
     def test_checkpoint_and_image_orphans_expire_after_24_hours(self) -> None:
         _, slot = self.start()
         self.checkpoints.upload(slot)
-        image = self.media.issue(
-            self.owner, IssueImage(id=uuid7(), size=len(AVIF), hash=DIGEST)
+        image = async_support.run(
+            self.media.issue(
+                self.owner, IssueImage(id=uuid7(), size=len(AVIF), hash=DIGEST)
+            )
         )
         self.images.upload_image(image, AVIF)
-        self.assertEqual(self.cleanup.run().checkpoints, 0)
+        self.assertEqual(async_support.run(self.cleanup.run()).checkpoints, 0)
         with self.db.admin_transaction() as session:
             session.execute(
                 "update documents.checkpoints set issued_at=clock_timestamp()-interval '25 hours'"
@@ -569,7 +653,7 @@ class DocumentTests(unittest.TestCase):
             session.execute(
                 "update coordination.uploads set issued_at=clock_timestamp()-interval '25 hours'"
             )
-        result = self.cleanup.run()
+        result = async_support.run(self.cleanup.run())
         self.assertEqual((result.checkpoints, result.images), (1, 1))
         with self.db.transaction() as session:
             self.assertEqual(session.execute("select * from documents.checkpoints"), [])
@@ -582,8 +666,10 @@ class DocumentTests(unittest.TestCase):
 
         _, slot = self.start()
         self.checkpoints.upload(slot)
-        image = self.media.issue(
-            self.owner, IssueImage(id=uuid7(), size=len(AVIF), hash=DIGEST)
+        image = async_support.run(
+            self.media.issue(
+                self.owner, IssueImage(id=uuid7(), size=len(AVIF), hash=DIGEST)
+            )
         )
         self.images.upload_image(image, AVIF)
         with self.db.admin_transaction() as session:
@@ -595,14 +681,14 @@ class DocumentTests(unittest.TestCase):
             )
         original = self.cleanup._finish_deletes
 
-        def fail_commit(
+        async def fail_commit(
             checkpoints: list[CheckpointJob], images: list[ImageJob]
         ) -> None:
             self.db.fail_commit = True
-            original(checkpoints, images)
+            await original(checkpoints, images)
 
         with patch.object(self.cleanup, "_finish_deletes", side_effect=fail_commit):
-            result = self.cleanup.run()
+            result = async_support.run(self.cleanup.run())
         self.assertEqual(
             (result.checkpoints, result.images, result.failures), (0, 0, 2)
         )
@@ -615,7 +701,7 @@ class DocumentTests(unittest.TestCase):
                 session.execute("select state from coordination.uploads"),
                 [{"state": "pending"}],
             )
-        result = self.cleanup.run()
+        result = async_support.run(self.cleanup.run())
         self.assertEqual(
             (result.checkpoints, result.images, result.failures), (1, 1, 0)
         )
@@ -626,22 +712,26 @@ class DocumentTests(unittest.TestCase):
         batch, slot = self.start()
         self.checkpoints.upload(slot)
         self.publish(batch, slot)
-        self.documents.lifecycle(self.owner, self.document.id, trashed=True)
-        self.assertEqual(self.cleanup.run().documents, 0)
+        async_support.run(
+            self.documents.lifecycle(self.owner, self.document.id, trashed=True)
+        )
+        self.assertEqual(async_support.run(self.cleanup.run()).documents, 0)
         with self.db.admin_transaction() as session:
             session.execute(
                 "update documents.documents set trashed_at=clock_timestamp()-interval '4 days' where id=%s",
                 (self.document.id,),
             )
         self.checkpoints.fail_delete = True
-        self.assertEqual(self.cleanup.run().documents, 0)
+        self.assertEqual(async_support.run(self.cleanup.run()).documents, 0)
         with self.assertRaises(ServiceError):
-            self.documents.lifecycle(self.owner, self.document.id, trashed=False)
+            async_support.run(
+                self.documents.lifecycle(self.owner, self.document.id, trashed=False)
+            )
         self.checkpoints.fail_delete = False
-        self.assertEqual(self.cleanup.run().documents, 1)
+        self.assertEqual(async_support.run(self.cleanup.run()).documents, 1)
         self.assertNotIn(slot.key, self.checkpoints.objects)
         with self.assertRaises(NotFound):
-            self.documents.metadata(self.owner, self.document.id)
+            async_support.run(self.documents.metadata(self.owner, self.document.id))
 
     def test_image_links_require_editor_uploads_and_preserve_existing_history_links(
         self,
@@ -651,23 +741,28 @@ class DocumentTests(unittest.TestCase):
         batch, slot = self.start()
         self.checkpoints.upload(slot)
         self.assertEqual(self.publish(batch, slot, images=[viewer_image]), "invalid")
-        retry = self.sync.retry(
-            self.owner,
-            batch,
-            self.document.id,
-            RetryUpload(
-                previous_revision=slot.revision,
-                base_revision=None,
-                size=10,
-                hash=DIGEST,
-            ),
+        retry = async_support.run(
+            self.sync.retry(
+                self.owner,
+                batch,
+                self.document.id,
+                RetryUpload(
+                    previous_revision=slot.revision,
+                    base_revision=None,
+                    size=10,
+                    hash=DIGEST,
+                ),
+            )
         )
         self.checkpoints.upload(retry)
         self.assertEqual(self.publish(batch, retry, images=[editor_image]), "published")
         self.assertEqual(
-            self.media.content(self.viewer, editor_image)[0].id, editor_image
+            async_support.run(self.media.content(self.viewer, editor_image))[0].id,
+            editor_image,
         )
-        self.documents.grant(self.owner, self.document.id, self.editor.id, None)
+        async_support.run(
+            self.documents.grant(self.owner, self.document.id, self.editor.id, None)
+        )
         self.clear_window()
         new_batch, new_slot = self.start()
         self.checkpoints.upload(new_slot)
@@ -675,13 +770,15 @@ class DocumentTests(unittest.TestCase):
             self.publish(new_batch, new_slot, images=[editor_image]), "published"
         )
         with self.assertRaises(ServiceError):
-            self.media.delete(self.editor, editor_image)
+            async_support.run(self.media.delete(self.editor, editor_image))
 
     def test_avif_size_format_quota_and_confirm_idempotency(self) -> None:
         data = AVIF + b"\x00" * (MAX_IMAGE_BYTES - len(AVIF))
         image = self.image(data=data)
         heads = len(self.images.heads)
-        self.assertEqual(self.media.confirm(self.owner, image).id, image)
+        self.assertEqual(
+            async_support.run(self.media.confirm(self.owner, image)).id, image
+        )
         self.assertEqual(len(self.images.heads), heads)
         with self.assertRaises(ValidationError):
             IssueImage(id=uuid7(), size=MAX_IMAGE_BYTES + 1, hash=DIGEST)
@@ -690,40 +787,51 @@ class DocumentTests(unittest.TestCase):
                 IssueImage.model_validate(
                     {"id": str(uuid7()), "size": 10, "hash": DIGEST, "media_type": kind}
                 )
-        slot = self.media.issue(
-            self.owner, IssueImage(id=uuid7(), size=10, hash=DIGEST)
+        slot = async_support.run(
+            self.media.issue(self.owner, IssueImage(id=uuid7(), size=10, hash=DIGEST))
         )
         self.images.upload_image(slot, b"GIF89a1234")
         with self.assertRaises(ServiceError) as failure:
-            self.media.confirm(self.owner, slot.id)
+            async_support.run(self.media.confirm(self.owner, slot.id))
         self.assertEqual(failure.exception.code, "invalid_avif")
         self.assertNotIn(slot.key, self.images.objects)
-        limited = ImageService(self.db, self.images, self.image_signer, daily_quota=1)
+        limited = ImageService(
+            async_support.database(self.db),
+            async_support.images(self.images),
+            self.image_signer,
+            daily_quota=1,
+        )
         with self.assertRaises(ServiceError):
-            limited.issue(self.owner, IssueImage(id=uuid7(), size=10, hash="b" * 64))
+            async_support.run(
+                limited.issue(
+                    self.owner, IssueImage(id=uuid7(), size=10, hash="b" * 64)
+                )
+            )
 
     def test_avatar_is_an_ordinary_owned_image_and_references_prevent_deletion(
         self,
     ) -> None:
         image = self.image()
         with self.assertRaises(NotFound):
-            self.media.metadata(self.viewer, image)
-        self.identity.select_avatar(self.owner, image)
-        self.assertEqual(self.media.avatar(self.owner.id)[0].id, image)
+            async_support.run(self.media.metadata(self.viewer, image))
+        async_support.run(self.identity.select_avatar(self.owner, image))
+        self.assertEqual(
+            async_support.run(self.media.avatar(self.owner.id))[0].id, image
+        )
         with self.assertRaises(NotFound):
-            self.identity.select_avatar(self.viewer, image)
+            async_support.run(self.identity.select_avatar(self.viewer, image))
         with self.assertRaises(ServiceError):
-            self.media.delete(self.owner, image)
-        self.identity.select_avatar(self.owner, None)
-        self.media.delete(self.owner, image)
+            async_support.run(self.media.delete(self.owner, image))
+        async_support.run(self.identity.select_avatar(self.owner, None))
+        async_support.run(self.media.delete(self.owner, image))
         with self.assertRaises(NotFound):
-            self.media.avatar(self.owner.id)
+            async_support.run(self.media.avatar(self.owner.id))
 
     def test_three_refusals_stop_retries_without_resetting_the_batch_window(
         self,
     ) -> None:
         batch, slot = self.start()
-        started = self.identity.current(self.owner).last_sync
+        started = async_support.run(self.identity.current(self.owner)).last_sync
         for index in range(3):
             self.checkpoints.upload(slot)
             self.checkpoints.objects[slot.key] = ObjectMetadata(
@@ -737,16 +845,22 @@ class DocumentTests(unittest.TestCase):
                 hash=DIGEST,
             )
             if index < 2:
-                slot = self.sync.retry(self.owner, batch, self.document.id, command)
-                duplicate = self.sync.retry(
-                    self.owner, batch, self.document.id, command
+                slot = async_support.run(
+                    self.sync.retry(self.owner, batch, self.document.id, command)
+                )
+                duplicate = async_support.run(
+                    self.sync.retry(self.owner, batch, self.document.id, command)
                 )
                 self.assertEqual(slot.revision, duplicate.revision)
             else:
                 with self.assertRaises(ServiceError) as failure:
-                    self.sync.retry(self.owner, batch, self.document.id, command)
+                    async_support.run(
+                        self.sync.retry(self.owner, batch, self.document.id, command)
+                    )
                 self.assertEqual(failure.exception.code, "retry_limit")
-        self.assertEqual(self.identity.current(self.owner).last_sync, started)
+        self.assertEqual(
+            async_support.run(self.identity.current(self.owner)).last_sync, started
+        )
 
     def test_retry_revision_order_survives_a_different_hosts_older_clock(self) -> None:
         from unittest.mock import patch
@@ -757,19 +871,32 @@ class DocumentTests(unittest.TestCase):
             previous_revision=slot.revision, base_revision=None, size=10, hash=DIGEST
         )
         with patch("app.services.identifiers.uuid7", return_value=older):
-            retried = self.sync.retry(self.owner, batch, self.document.id, command)
+            retried = async_support.run(
+                self.sync.retry(self.owner, batch, self.document.id, command)
+            )
         self.assertGreater(retried.revision, slot.revision)
         self.assertEqual(
-            self.sync.retry(self.owner, batch, self.document.id, command).revision,
+            async_support.run(
+                self.sync.retry(self.owner, batch, self.document.id, command)
+            ).revision,
             retried.revision,
         )
 
     def test_concurrent_image_reservations_cannot_exceed_total_quota(self) -> None:
-        limited = ImageService(self.db, self.images, self.image_signer, total_quota=1)
+        limited = ImageService(
+            async_support.database(self.db),
+            async_support.images(self.images),
+            self.image_signer,
+            total_quota=1,
+        )
 
         def reserve(digest: str) -> str:
             try:
-                limited.issue(self.owner, IssueImage(id=uuid7(), size=10, hash=digest))
+                async_support.run(
+                    limited.issue(
+                        self.owner, IssueImage(id=uuid7(), size=10, hash=digest)
+                    )
+                )
                 return "issued"
             except ServiceError as error:
                 return error.code
@@ -797,15 +924,18 @@ class DocumentTests(unittest.TestCase):
                 )
         batch, slot = self.start()
         for ids in (image_ids[:200], image_ids[200:], image_ids[:200]):
-            self.sync.stage_images(
-                self.owner, batch, self.document.id, slot.revision, ids
+            async_support.run(
+                self.sync.stage_images(
+                    self.owner, batch, self.document.id, slot.revision, ids
+                )
             )
         with self.assertRaises(NotFound):
-            self.media.metadata(self.viewer, image_ids[0])
+            async_support.run(self.media.metadata(self.viewer, image_ids[0]))
         self.checkpoints.upload(slot)
         self.assertEqual(self.publish(batch, slot), "published")
         self.assertEqual(
-            self.media.metadata(self.viewer, image_ids[0]).id, image_ids[0]
+            async_support.run(self.media.metadata(self.viewer, image_ids[0])).id,
+            image_ids[0],
         )
         with self.db.transaction() as session:
             self.assertEqual(
@@ -813,39 +943,57 @@ class DocumentTests(unittest.TestCase):
             )
             self.assertEqual(session.execute("select * from coordination.images"), [])
         with self.assertRaises(Conflict):
-            self.sync.stage_images(
-                self.owner, batch, self.document.id, slot.revision, image_ids
+            async_support.run(
+                self.sync.stage_images(
+                    self.owner, batch, self.document.id, slot.revision, image_ids
+                )
             )
 
     def test_staged_images_recheck_the_uploaders_edit_grant_at_publish(self) -> None:
         image = self.image(self.editor)
         batch, slot = self.start()
-        self.sync.stage_images(
-            self.owner, batch, self.document.id, slot.revision, [image]
+        async_support.run(
+            self.sync.stage_images(
+                self.owner, batch, self.document.id, slot.revision, [image]
+            )
         )
-        self.documents.grant(self.owner, self.document.id, self.editor.id, None)
+        async_support.run(
+            self.documents.grant(self.owner, self.document.id, self.editor.id, None)
+        )
         self.checkpoints.upload(slot)
         self.assertEqual(self.publish(batch, slot), "invalid")
-        self.assertIsNone(self.sync.open(self.owner, self.document.id, None).revision)
+        self.assertIsNone(
+            async_support.run(
+                self.sync.open(self.owner, self.document.id, None)
+            ).revision
+        )
 
     def test_daily_quota_counts_deleted_uploads_and_dedup_still_works_when_full(
         self,
     ) -> None:
         image = self.image()
         limited = ImageService(
-            self.db, self.images, self.image_signer, daily_quota=1, total_quota=1
+            async_support.database(self.db),
+            async_support.images(self.images),
+            self.image_signer,
+            daily_quota=1,
+            total_quota=1,
         )
-        reused = limited.issue(
-            self.owner,
-            IssueImage(
-                id=uuid7(), size=len(AVIF), hash=hashlib.sha256(AVIF).hexdigest()
-            ),
+        reused = async_support.run(
+            limited.issue(
+                self.owner,
+                IssueImage(
+                    id=uuid7(), size=len(AVIF), hash=hashlib.sha256(AVIF).hexdigest()
+                ),
+            )
         )
         self.assertEqual(reused.id, image)
         self.assertIsNone(reused.upload)
-        self.media.delete(self.owner, image)
+        async_support.run(self.media.delete(self.owner, image))
         with self.assertRaises(ServiceError):
-            limited.issue(self.owner, IssueImage(id=uuid7(), size=10, hash=DIGEST))
+            async_support.run(
+                limited.issue(self.owner, IssueImage(id=uuid7(), size=10, hash=DIGEST))
+            )
 
     def test_deleted_objects_are_reaped_again_after_upload_permission_expiry(
         self,
@@ -861,32 +1009,37 @@ class DocumentTests(unittest.TestCase):
             session.execute(
                 "update documents.checkpoints set issued_at=clock_timestamp()-interval '25 hours'"
             )
-        self.cleanup.run()
+        async_support.run(self.cleanup.run())
         self.assertNotIn(slot.key, self.checkpoints.objects)
 
     def test_http_routes_keep_avatars_public_and_sync_bodies_metadata_only(
         self,
     ) -> None:
-        from unittest.mock import Mock, patch
+        from unittest.mock import Mock
 
         from fastapi.testclient import TestClient
 
         from app.authentication.service import AuthenticationService
+        from app.execution import InlineExecutor
         from app.main import create_app
         from app.settings import Settings
+        from app.state import legacy_resources
 
         image = self.image()
-        self.identity.select_avatar(self.owner, image)
+        async_support.run(self.identity.select_avatar(self.owner, image))
         authentication = Mock(spec=AuthenticationService)
         authentication.authenticate.return_value = Identity(
             issuer=self.owner.issuer, subject=self.owner.subject
         )
-        with patch(
-            "app.main.build_authentication_service", return_value=authentication
-        ):
-            application = create_app(
-                Settings(_env_file=None), database=self.db, storage=self.storage
+        application = create_app(
+            legacy_resources(
+                Settings(_env_file=None),
+                InlineExecutor(),
+                database=self.db,
+                storage=self.storage,
+                authentication=authentication,
             )
+        )
         with TestClient(application) as client:
             public = client.get(f"/avatars/{self.owner.id}")
             self.assertEqual(public.status_code, 200)
@@ -938,27 +1091,32 @@ class DocumentTests(unittest.TestCase):
     def test_native_image_stream_handoff_preserves_authorization_and_headers(
         self,
     ) -> None:
-        from unittest.mock import Mock, patch
+        from unittest.mock import Mock
 
         from fastapi.testclient import TestClient
         from starlette.types import Receive, Scope, Send
 
         from app.authentication.service import AuthenticationService
+        from app.execution import InlineExecutor
         from app.main import create_app
         from app.settings import Settings
+        from app.state import legacy_resources
 
         image = self.image()
-        self.identity.select_avatar(self.owner, image)
+        async_support.run(self.identity.select_avatar(self.owner, image))
         authentication = Mock(spec=AuthenticationService)
         authentication.authenticate.return_value = Identity(
             issuer=self.owner.issuer, subject=self.owner.subject
         )
-        with patch(
-            "app.main.build_authentication_service", return_value=authentication
-        ):
-            application = create_app(
-                Settings(_env_file=None), database=self.db, storage=self.storage
+        application = create_app(
+            legacy_resources(
+                Settings(_env_file=None),
+                InlineExecutor(),
+                database=self.db,
+                storage=self.storage,
+                authentication=authentication,
             )
+        )
         bodies: list[ImageBody] = []
 
         async def native_host(scope: Scope, receive: Receive, send: Send) -> None:

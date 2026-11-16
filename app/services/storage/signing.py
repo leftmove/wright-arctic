@@ -20,6 +20,14 @@ def _signing_key(secret: str, date: str, region: str) -> bytes:
 
 
 @dataclass(frozen=True, repr=False)
+class SignedRequest:
+    method: Literal["GET", "PUT", "HEAD", "DELETE"]
+    url: str
+    headers: dict[str, str]
+    expires_at: datetime
+
+
+@dataclass(frozen=True, repr=False)
 class S3Signer:
     endpoint: str
     bucket: str
@@ -39,6 +47,20 @@ class S3Signer:
         media_type: str | None = None,
         now: datetime | None = None,
     ) -> Permission:
+        signed = self.request(key, seconds, method=method, size=size, sha256=sha256, media_type=media_type, now=now)
+        return Permission(method=method, url=signed.url, headers=signed.headers, expires_at=signed.expires_at)
+
+    def request(
+        self,
+        key: str,
+        seconds: int,
+        *,
+        method: Literal["GET", "PUT", "HEAD", "DELETE"],
+        size: int | None = None,
+        sha256: str | None = None,
+        media_type: str | None = None,
+        now: datetime | None = None,
+    ) -> SignedRequest:
         now = (now or datetime.now(UTC)).replace(microsecond=0)
         if not 1 <= seconds <= 900:
             raise ValueError("Capabilities must expire within fifteen minutes")
@@ -94,7 +116,7 @@ class S3Signer:
         signature = hmac.digest(
             _signing_key(self.secret_key, date, self.region), to_sign.encode(), "sha256"
         ).hex()
-        return Permission(
+        return SignedRequest(
             method=method,
             url=urlunsplit(
                 (

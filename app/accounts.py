@@ -9,3 +9,10 @@ class Identity:
 
     subject: str
     issuer: str
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedActor:
+    """Request-local actor; resolution belongs to the domain unit of work."""
+
+    identity: Identity

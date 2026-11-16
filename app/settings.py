@@ -40,6 +40,10 @@ class Settings(BaseSettings):
         default=None, exclude=True, repr=False
     )
     documents_pool_size: int = Field(default=4, ge=1, le=32)
+    storage_concurrency: int = Field(default=8, ge=1, le=32)
+    application_deadline_seconds: float = Field(default=10, ge=1, le=30)
+    admission_limit: int = Field(default=16, ge=1, le=64)
+    service_mode: Literal["api", "maintenance"] = "api"
     auth_issuer: str | None = None
     auth_jwks_url: AnyHttpUrl | None = None
     auth_publishable_key: SecretStr | None = Field(

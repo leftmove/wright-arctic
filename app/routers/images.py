@@ -10,22 +10,19 @@ from pydantic import UUID7
 from app.dependencies import AccountDep, execute, require_image_service
 from app.schemas import ImageResponse, ImageUploadResponse, IssueImage
 from app.services.models import Image
-from app.services.storage.objects import ImageBody
+from app.services.pagination import decode_cursor, encode_cursor
+from app.services.storage.objects import AsyncImageBody as ImageBody
 
 router = APIRouter(prefix="/images", tags=["images"])
 avatars = APIRouter(prefix="/avatars", tags=["public avatars"])
 
 
-def _next(body: ImageBody) -> bytes | None:
-    return next(body.chunks, None)
-
-
 async def _stream(request: Request, body: ImageBody) -> AsyncIterator[bytes]:
     try:
-        while (chunk := await execute(request, _next, body)) is not None:
+        async for chunk in body.chunks:
             yield chunk
     finally:
-        await execute(request, body.close)
+        await body.close()
 
 
 def _image_response(
@@ -42,7 +39,7 @@ def _image_response(
     if request.scope.get("extensions", {}).get("wright.native_image_stream"):
         # The Worker transfers the authorized R2 stream directly to its response.
         # Routing, grants, validation, and cache headers still run through ASGI.
-        request.state.image_body = body
+        request.state.image_body = body.native
         return Response(media_type="image/avif", headers=headers)
     return StreamingResponse(
         _stream(request, body), media_type="image/avif", headers=headers
@@ -71,16 +68,22 @@ async def confirm_image(
 async def list_images(
     account: AccountDep,
     request: Request,
+    response: Response,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+    cursor: Annotated[str | None, Query(max_length=256)] = None,
 ) -> list[ImageResponse]:
-    return await execute(
+    images = await execute(
         request,
         require_image_service(request).list_images,
         account,
         limit=limit,
         offset=offset,
+        cursor=decode_cursor(cursor, offset=offset),
     )
+    if len(images) == limit:
+        response.headers["X-Next-Cursor"] = encode_cursor(images[-1].created_at, images[-1].id)
+    return images
 
 
 @router.get("/by-hash/{digest}")

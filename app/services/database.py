@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import (
+    AbstractAsyncContextManager,
+    AbstractContextManager,
+    contextmanager,
+)
 from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 
 if TYPE_CHECKING:
@@ -13,6 +17,20 @@ if TYPE_CHECKING:
 from app.services.errors import Conflict, Unavailable
 
 type Row = dict[str, object]
+
+
+class AsyncSession(Protocol):
+    async def execute(
+        self, query: str, parameters: Sequence[object] = ()
+    ) -> list[Row]: ...
+
+
+class AsyncDatabase(Protocol):
+    def transaction(self) -> AbstractAsyncContextManager[AsyncSession]: ...
+    def read(self) -> AbstractAsyncContextManager[AsyncSession]: ...
+    async def open(self) -> None: ...
+    async def close(self) -> None: ...
+
 
 TRANSACTION_SETTINGS = "set local statement_timeout='15s'; set local lock_timeout='5s'"
 

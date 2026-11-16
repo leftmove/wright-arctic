@@ -7,14 +7,22 @@ from uuid import UUID
 from pydantic import UUID7, AwareDatetime
 
 from app.schemas import ImageResponse, ImageUploadResponse, IssueImage
-from app.services.database import Database, Session
+from app.services.database import AsyncDatabase as Database
+from app.services.database import AsyncSession as Session
 from app.services.errors import Conflict, NotFound, ServiceError
 from app.services.identifiers import image_key
-from app.services.limits import MAX_IMAGE_BYTES, UPLOAD_TIMEOUT_SECONDS
+from app.services.identity.actor import Actor, resolve_actor
+from app.services.limits import MAX_IMAGE_BYTES
 from app.services.models import Account, Image, Record
+from app.services.operations import operation
+from app.services.pagination import PageCursor
 from app.services.storage.objects import (
-    ImageBody,
-    ImageObjects,
+    AsyncImageBody as ImageBody,
+)
+from app.services.storage.objects import (
+    AsyncImageObjects as ImageObjects,
+)
+from app.services.storage.objects import (
     ObjectMissing,
     StorageUnavailable,
 )
@@ -95,13 +103,17 @@ class ImageService:
             id=upload.id, key=upload.key, upload=permission, image=None
         )
 
-    def issue(self, account: Account, command: IssueImage) -> ImageUploadResponse:
-        with self._database.transaction() as session:
-            session.execute(
-                "select id from public.accounts where id=%s for update", (account.id,)
+    async def issue(self, account: Actor, command: IssueImage) -> ImageUploadResponse:
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            (
+                await session.execute(
+                    "select id from public.accounts where id=%s for update",
+                    (account.id,),
+                )
             )
-            now = database_time(session)
-            existing = session.execute(
+            now = await database_time(session)
+            existing = await session.execute(
                 "select * from public.images where id=%s and account=%s and deleted_at is null",
                 (command.id, account.id),
             )
@@ -112,11 +124,11 @@ class ImageService:
                 return ImageUploadResponse(
                     id=image.id, key=image.key, upload=None, image=image_response(image)
                 )
-            if session.execute(
+            if await session.execute(
                 "select id from public.images where id=%s", (command.id,)
             ):
                 raise Conflict("image_id_reused")
-            reservations = session.execute(
+            reservations = await session.execute(
                 "select * from coordination.uploads where id=%s", (command.id,)
             )
             if reservations:
@@ -130,7 +142,7 @@ class ImageService:
                 ):
                     raise Conflict("image_id_reused")
                 return self._slot(upload, now)
-            duplicates = session.execute(
+            duplicates = await session.execute(
                 "select * from public.images where account=%s and hash=%s and deleted_at is null order by id limit 1",
                 (account.id, command.hash),
             )
@@ -139,19 +151,21 @@ class ImageService:
                 return ImageUploadResponse(
                     id=image.id, key=image.key, upload=None, image=image_response(image)
                 )
-            counts = session.execute(
-                """select
+            counts = (
+                await session.execute(
+                    """select
                     (select count(*) from coordination.uploads where account=%s and issued_at >= %s) as daily,
                     ((select count(*) from public.images where account=%s and deleted_at is null) +
                      (select count(*) from coordination.uploads where account=%s and state='issued')) as total""",
-                (
-                    account.id,
-                    now.astimezone(UTC).replace(
-                        hour=0, minute=0, second=0, microsecond=0
+                    (
+                        account.id,
+                        now.astimezone(UTC).replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        ),
+                        account.id,
+                        account.id,
                     ),
-                    account.id,
-                    account.id,
-                ),
+                )
             )[0]
             if (
                 int(str(counts["daily"])) >= self._daily
@@ -162,7 +176,7 @@ class ImageService:
                     "The daily or stored image quota has been reached.",
                     429,
                 )
-            rows = session.execute(
+            rows = await session.execute(
                 """insert into coordination.uploads(id,account,key,size,hash,issued_at,expires_at)
                     values(%s,%s,%s,%s,%s,%s,%s) returning *""",
                 (
@@ -177,90 +191,86 @@ class ImageService:
             )
             return self._slot(ImageUpload.model_validate(rows[0]), now)
 
-    def confirm(self, account: Account, image_id: UUID) -> ImageResponse:
-        invalid: ImageUpload | None = None
-        with self._database.transaction() as session:
-            session.execute(
-                "select id from public.accounts where id=%s for update", (account.id,)
+    async def confirm(self, account: Actor, image_id: UUID) -> ImageResponse:
+        async with self._database.read() as session:
+            account = await resolve_actor(session, account)
+            state = await operation(
+                session, "image_preflight", (account.id, image_id), _Confirmation
             )
-            rows = session.execute(
-                "select * from public.images where id=%s and account=%s and deleted_at is null",
-                (image_id, account.id),
+        if state.image is not None:
+            return image_response(state.image)
+        upload = state.upload
+        assert upload is not None
+        metadata = await self._objects.head(upload.key)
+        valid = (
+            metadata.size == upload.size
+            and 0 < metadata.size <= MAX_IMAGE_BYTES
+            and metadata.media_type == "image/avif"
+            and metadata.metadata.get("sha256") == upload.hash
+            and is_avif(await self._objects.prefix(upload.key, 512))
+        )
+        async with self._database.transaction() as session:
+            state = await operation(
+                session,
+                "confirm_verified_image",
+                (
+                    account.id,
+                    image_id,
+                    upload.key,
+                    upload.hash,
+                    upload.size,
+                    upload.issued_at,
+                    valid,
+                ),
+                _Confirmation,
             )
-            if rows:
-                return image_response(Image.model_validate(rows[0]))
-            rows = session.execute(
-                "select * from coordination.uploads where id=%s and account=%s for update",
-                (image_id, account.id),
-            )
-            if not rows:
-                raise NotFound()
-            upload = ImageUpload.model_validate(rows[0])
-            now = database_time(session)
-            if upload.state != "issued" or now >= upload.issued_at + timedelta(
-                seconds=UPLOAD_TIMEOUT_SECONDS
-            ):
-                raise ServiceError(
-                    "image_upload_expired", "Request a new image upload slot.", 410
-                )
-            metadata = self._objects.head(upload.key)
-            if (
-                metadata.size != upload.size
-                or not 0 < metadata.size <= MAX_IMAGE_BYTES
-                or metadata.media_type != "image/avif"
-                or metadata.metadata.get("sha256") != upload.hash
-                or not is_avif(self._objects.prefix(upload.key, 512))
-            ):
-                session.execute(
-                    "update coordination.uploads set state='pending' where id=%s",
-                    (image_id,),
-                )
-                invalid = upload
-            else:
-                rows = session.execute(
-                    """insert into public.images(id,account,key,size,hash,created_at) values(%s,%s,%s,%s,%s,%s) returning *""",
-                    (upload.id, account.id, upload.key, upload.size, upload.hash, now),
-                )
-                session.execute(
-                    "update coordination.uploads set state='confirmed' where id=%s",
-                    (image_id,),
-                )
-                return image_response(Image.model_validate(rows[0]))
-        assert invalid is not None
-        self.discard(invalid.id, invalid.key)
+        if state.image is not None:
+            return image_response(state.image)
+        await self.discard(upload.id, upload.key)
         raise ServiceError(
             "invalid_avif",
             "Upload an AVIF matching the authorized size and SHA-256.",
             415,
         )
 
-    def discard(self, image_id: UUID, key: str) -> bool:
+    async def discard(self, image_id: UUID, key: str) -> bool:
         try:
-            self._objects.delete(key)
+            (await self._objects.delete(key))
         except StorageUnavailable:
             return False
-        with self._database.transaction() as session:
-            session.execute(
-                "update coordination.uploads set state='deleted' where id=%s and state='pending'",
-                (image_id,),
+        async with self._database.transaction() as session:
+            (
+                await session.execute(
+                    "update coordination.uploads set state='deleted' where id=%s and state='pending'",
+                    (image_id,),
+                )
             )
         return True
 
-    def list_images(
-        self, account: Account, *, limit: int, offset: int
+    async def list_images(
+        self, account: Actor, *, limit: int, offset: int, cursor: PageCursor | None = None
     ) -> list[ImageResponse]:
-        with self._database.transaction() as session:
+        async with self._database.read() as session:
+            account = await resolve_actor(session, account)
+            boundary = " and (created_at<%s or (created_at=%s and id>%s))" if cursor else ""
+            parameters: list[object] = [account.id]
+            if cursor:
+                parameters.extend([cursor.timestamp, cursor.timestamp, cursor.id])
+            parameters.extend([limit, offset])
             return [
                 image_response(Image.model_validate(row))
-                for row in session.execute(
-                    "select * from public.images where account=%s and deleted_at is null order by created_at desc,id limit %s offset %s",
-                    (account.id, limit, offset),
+                for row in (
+                    await session.execute(
+                        "select * from public.images where account=%s and deleted_at is null"+boundary+" order by created_at desc,id limit %s offset %s",
+                        parameters,
+                    )
                 )
             ]
 
-    def by_hash(self, account: Account, digest: str) -> ImageResponse:
-        with self._database.transaction() as session:
-            rows = session.execute(
+    async def by_hash(self, account: Actor, digest: str) -> ImageResponse:
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            rows = await session.execute(
                 "select * from public.images where account=%s and hash=%s and deleted_at is null order by id limit 1",
                 (account.id, digest),
             )
@@ -268,8 +278,10 @@ class ImageService:
                 raise NotFound()
             return image_response(Image.model_validate(rows[0]))
 
-    def _readable(self, session: Session, account: Account, image_id: UUID) -> Image:
-        rows = session.execute(
+    async def _readable(
+        self, session: Session, account: Account, image_id: UUID
+    ) -> Image:
+        rows = await session.execute(
             """select i.* from public.images i where i.id=%s and i.deleted_at is null
                 and (i.account=%s or exists(select 1 from documents.images r
                     join documents.grants g on g.document_id=r.document_id
@@ -281,18 +293,20 @@ class ImageService:
             raise NotFound()
         return Image.model_validate(rows[0])
 
-    def metadata(self, account: Account, image_id: UUID) -> ImageResponse:
-        with self._database.transaction() as session:
-            return image_response(self._readable(session, account, image_id))
+    async def metadata(self, account: Actor, image_id: UUID) -> ImageResponse:
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            return image_response(await self._readable(session, account, image_id))
 
-    def content(self, account: Account, image_id: UUID) -> tuple[Image, ImageBody]:
-        with self._database.transaction() as session:
-            image = self._readable(session, account, image_id)
-        return image, self._stream(image)
+    async def content(self, account: Actor, image_id: UUID) -> tuple[Image, ImageBody]:
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            image = await self._readable(session, account, image_id)
+        return image, (await self._stream(image))
 
-    def avatar(self, account_id: UUID) -> tuple[Image, ImageBody]:
-        with self._database.transaction() as session:
-            rows = session.execute(
+    async def avatar(self, account_id: UUID) -> tuple[Image, ImageBody]:
+        async with self._database.transaction() as session:
+            rows = await session.execute(
                 """select i.* from public.accounts a join public.images i on i.id=a.avatar_id
                 where a.id=%s and i.deleted_at is null""",
                 (account_id,),
@@ -300,31 +314,35 @@ class ImageService:
             if not rows:
                 raise NotFound()
             image = Image.model_validate(rows[0])
-        return image, self._stream(image)
+        return image, (await self._stream(image))
 
-    def _stream(self, image: Image) -> ImageBody:
+    async def _stream(self, image: Image) -> ImageBody:
         try:
-            body = self._objects.stream(image.key)
+            body = await self._objects.stream(image.key)
         except ObjectMissing:
             raise NotFound() from None
         if body.size != image.size:
-            body.close()
+            (await body.close())
             raise StorageUnavailable()
         return body
 
-    def delete(self, account: Account, image_id: UUID) -> None:
-        with self._database.transaction() as session:
-            session.execute(
-                "select id from public.accounts where id=%s for update", (account.id,)
+    async def delete(self, account: Actor, image_id: UUID) -> None:
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            (
+                await session.execute(
+                    "select id from public.accounts where id=%s for update",
+                    (account.id,),
+                )
             )
-            rows = session.execute(
+            rows = await session.execute(
                 "select * from public.images where id=%s and account=%s for update",
                 (image_id, account.id),
             )
             if not rows:
                 raise NotFound()
             image = Image.model_validate(rows[0])
-            if session.execute(
+            if await session.execute(
                 """select image_id from documents.images where image_id=%s
                 union all select avatar_id from public.accounts where avatar_id=%s limit 1""",
                 (image_id, image_id),
@@ -333,21 +351,31 @@ class ImageService:
                     "image_referenced",
                     "Images referenced by document history or a profile cannot be deleted.",
                 )
-            session.execute(
-                "update public.images set deleted_at=coalesce(deleted_at,clock_timestamp()) where id=%s",
-                (image_id,),
+            (
+                await session.execute(
+                    "update public.images set deleted_at=coalesce(deleted_at,clock_timestamp()) where id=%s",
+                    (image_id,),
+                )
             )
-            session.execute(
-                """insert into coordination.uploads(id,account,key,size,hash,state,issued_at,expires_at)
+            (
+                await session.execute(
+                    """insert into coordination.uploads(id,account,key,size,hash,state,issued_at,expires_at)
                 values(%s,%s,%s,%s,%s,'pending',%s,clock_timestamp())
                 on conflict(id) do update set state='pending'""",
-                (
-                    image.id,
-                    image.account,
-                    image.key,
-                    image.size,
-                    image.hash,
-                    image.created_at,
-                ),
+                    (
+                        image.id,
+                        image.account,
+                        image.key,
+                        image.size,
+                        image.hash,
+                        image.created_at,
+                    ),
+                )
             )
-        self.discard(image.id, image.key)
+        (await self.discard(image.id, image.key))
+
+
+class _Confirmation(Record):
+    image: Image | None = None
+    upload: ImageUpload | None = None
+    invalid: bool = False

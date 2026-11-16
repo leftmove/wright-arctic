@@ -1,12 +1,13 @@
 """Coordinate whole-file uploads without accessing document content."""
 
+import json
 from datetime import datetime, timedelta
-from math import ceil
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid7
 
 from pydantic import UUID7, AwareDatetime
 
+from app.accounts import VerifiedActor
 from app.schemas import (
     BatchResponse,
     Pointer,
@@ -17,20 +18,24 @@ from app.schemas import (
     StartBatch,
     UploadSlot,
 )
-from app.services.database import Database, Session
-from app.services.documents.repository import document_for, documents_for
+from app.services.concurrency import bounded_map
+from app.services.database import AsyncDatabase as Database
+from app.services.database import AsyncSession as Session
+from app.services.documents.repository import document_for
 from app.services.errors import Conflict, NotFound, ServiceError, Unavailable
 from app.services.identifiers import checkpoint_key, new_revision
+from app.services.identity.actor import Actor, resolve_actor
 from app.services.limits import (
     CHECKPOINTS_RETAINED,
     MAX_CHECKPOINT_BYTES,
     MAX_REFUSALS,
-    SYNC_WINDOW_SECONDS,
-    UPLOAD_TIMEOUT_SECONDS,
 )
 from app.services.models import Account, CheckpointState, Document, Record
+from app.services.operations import operation
 from app.services.storage.objects import (
-    CheckpointObjects,
+    AsyncCheckpointObjects as CheckpointObjects,
+)
+from app.services.storage.objects import (
     ObjectMissing,
     StorageUnavailable,
 )
@@ -66,10 +71,10 @@ class Attempt(Record):
     refusals: int
 
 
-def batch_for(
+async def batch_for(
     session: Session, account: Account, batch_id: UUID, *, lock: bool = False
 ) -> Batch:
-    rows = session.execute(
+    rows = await session.execute(
         "select * from coordination.batches where id=%s and account=%s"
         + (" for update" if lock else ""),
         (batch_id, account.id),
@@ -79,15 +84,20 @@ def batch_for(
     return Batch.model_validate(rows[0])
 
 
-def attempt_for(
+async def attempt_for(
     session: Session, batch_id: UUID, document_id: UUID, revision: UUID | None = None
 ) -> Attempt | None:
-    return attempts_for(
-        session, batch_id, [document_id], [revision] if revision is not None else None
+    return (
+        await attempts_for(
+            session,
+            batch_id,
+            [document_id],
+            [revision] if revision is not None else None,
+        )
     ).get(document_id)
 
 
-def attempts_for(
+async def attempts_for(
     session: Session,
     batch_id: UUID,
     document_ids: list[UUID],
@@ -102,7 +112,7 @@ def attempts_for(
     if revisions is not None:
         query += " and (a.document_id,a.revision) in (select * from unnest(%s::uuid[],%s::uuid[]))"
         parameters.extend([document_ids, revisions])
-    rows = session.execute(
+    rows = await session.execute(
         query + " order by a.document_id,a.revision desc", parameters
     )
     return {
@@ -139,18 +149,33 @@ class SyncService:
             read=read,
         )
 
-    def open(
-        self, account: Account, document_id: UUID, known_revision: UUID | None
+    async def open(
+        self, account: Actor, document_id: UUID, known_revision: UUID | None
     ) -> Pointer:
-        with self._database.transaction() as session:
-            return self.pointer(
-                document_for(session, account, document_id), known_revision
-            )
+        async with self._database.read() as session:
+            if isinstance(account, VerifiedActor):
+                rows = await session.execute(
+                    "select coordination.open_pointer(%s,%s,%s,%s,%s) as result",
+                    (
+                        account.identity.issuer,
+                        account.identity.subject,
+                        uuid7(),
+                        uuid7(),
+                        document_id,
+                    ),
+                )
+                if rows[0]["result"] is None:
+                    raise NotFound()
+                document = Document.model_validate(rows[0]["result"])
+            else:
+                document = await document_for(session, account, document_id)
+            return self.pointer(document, known_revision)
 
-    def checkpoints(self, account: Account, document_id: UUID) -> list[Pointer]:
-        with self._database.transaction() as session:
-            document_for(session, account, document_id)
-            rows = session.execute(
+    async def checkpoints(self, account: Actor, document_id: UUID) -> list[Pointer]:
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            (await document_for(session, account, document_id))
+            rows = await session.execute(
                 """select document_id,revision,key,published_at
                 from documents.checkpoints where document_id=%s and state='published'
                 order by revision desc limit %s""",
@@ -170,36 +195,39 @@ class SyncService:
                 for value in records
             ]
 
-    def stage_images(
+    async def stage_images(
         self,
-        account: Account,
+        account: Actor,
         batch_id: UUID,
         document_id: UUID,
         revision: UUID,
         images: list[UUID],
     ) -> None:
-        with self._database.transaction() as session:
-            batch = batch_for(session, account, batch_id, lock=True)
-            document_for(session, account, document_id, edit=True, lock=True)
-            attempt = attempt_for(session, batch_id, document_id, revision)
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            batch = await batch_for(session, account, batch_id, lock=True)
+            (await document_for(session, account, document_id, edit=True, lock=True))
+            attempt = await attempt_for(session, batch_id, document_id, revision)
             if attempt is None:
                 raise NotFound()
             if (
                 attempt.state != "issued"
                 or attempt.result != "issued"
-                or database_time(session) >= batch.expires_at
+                or (await database_time(session)) >= batch.expires_at
             ):
                 raise Conflict("upload_slot_closed")
-            self._stage_images(session, document_id, revision, images)
+            (await self._stage_images(session, document_id, revision, images))
 
-    def _stage_images(
+    async def _stage_images(
         self, session: Session, document_id: UUID, revision: UUID, images: list[UUID]
     ) -> None:
         if images:
-            session.execute(
-                """insert into coordination.images(document_id,revision,image_id)
+            (
+                await session.execute(
+                    """insert into coordination.images(document_id,revision,image_id)
                 select %s,%s,unnest(%s::uuid[]) on conflict do nothing""",
-                (document_id, revision, images),
+                    (document_id, revision, images),
+                )
             )
 
     def _slot(self, attempt: Attempt, document: Document, now: datetime) -> UploadSlot:
@@ -228,7 +256,7 @@ class SyncService:
             result=attempt.result,
         )
 
-    def _issue(
+    async def _issue(
         self,
         session: Session,
         batch: Batch,
@@ -245,163 +273,69 @@ class SyncService:
         revision = new_revision(lower_bound)
         key = checkpoint_key(document.space, document.id, revision)
         expires = min(batch.expires_at, now + timedelta(seconds=self._seconds))
-        session.execute(
-            """insert into documents.checkpoints(document_id,revision,key,state,issued_at)
+        (
+            await session.execute(
+                """insert into documents.checkpoints(document_id,revision,key,state,issued_at)
                 values(%s,%s,%s,'issued',%s)""",
-            (document.id, revision, key, now),
+                (document.id, revision, key, now),
+            )
         )
-        session.execute(
-            """insert into coordination.attempts(document_id,revision,batch,base_revision,size,hash,expires_at)
+        (
+            await session.execute(
+                """insert into coordination.attempts(document_id,revision,batch,base_revision,size,hash,expires_at)
                 values(%s,%s,%s,%s,%s,%s,%s)""",
-            (document.id, revision, batch.id, document.revision, size, digest, expires),
+                (
+                    document.id,
+                    revision,
+                    batch.id,
+                    document.revision,
+                    size,
+                    digest,
+                    expires,
+                ),
+            )
         )
-        attempt = attempt_for(session, batch.id, document.id, revision)
+        attempt = await attempt_for(session, batch.id, document.id, revision)
         assert attempt is not None
         return attempt
 
-    def start(self, account: Account, command: StartBatch) -> BatchResponse:
-        with self._database.transaction() as session:
-            # Account locking makes the window global across devices and isolates.
-            accounts = session.execute(
-                "select * from public.accounts where id=%s for update", (account.id,)
+    async def start(self, account: Actor, command: StartBatch) -> BatchResponse:
+        items = [
+            {**item.model_dump(mode="json"), "candidate": str(new_revision())}
+            for item in command.documents
+        ]
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            state = await operation(
+                session,
+                "reserve_batch",
+                (account.id, command.id, json.dumps(items), self._seconds),
+                _Reservation,
             )
-            if not accounts:
-                raise NotFound()
-            current_account = Account.model_validate(accounts[0])
-            now = database_time(session)
-            existing = session.execute(
-                "select * from coordination.batches where id=%s", (command.id,)
-            )
-            if existing:
-                batch = Batch.model_validate(existing[0])
-                if batch.account != account.id:
-                    raise NotFound()
-                if now >= batch.expires_at:
-                    raise ServiceError("batch_expired", "This batch has expired.", 410)
-            else:
-                if current_account.last_sync is not None:
-                    next_start = current_account.last_sync + timedelta(
-                        seconds=SYNC_WINDOW_SECONDS
-                    )
-                    if now < next_start:
-                        raise ServiceError(
-                            "sync_window",
-                            f"The next batch may start at {next_start.isoformat()}.",
-                            429,
-                            headers={
-                                "Retry-After": str(
-                                    max(1, ceil((next_start - now).total_seconds()))
-                                ),
-                                "X-Next-Sync": next_start.isoformat(),
-                            },
-                        )
-                batch = Batch.model_validate(
-                    session.execute(
-                        "insert into coordination.batches(id,account,started_at,expires_at) values(%s,%s,%s,%s) returning *",
-                        (
-                            command.id,
-                            account.id,
-                            now,
-                            now + timedelta(seconds=UPLOAD_TIMEOUT_SECONDS),
-                        ),
-                    )[0]
-                )
-                session.execute(
-                    "update public.accounts set last_sync=%s where id=%s",
-                    (now, account.id),
-                )
-            # All multi-document mutations acquire document locks in UUID order.
-            document_ids = [item.document_id for item in command.documents]
-            documents = documents_for(
-                session, account, document_ids, lock=True, edit=True
-            )
-            attempts = attempts_for(session, batch.id, document_ids)
-            issued: list[Attempt] = []
-            for item in command.documents:
-                document = documents[item.document_id]
-                attempt = attempts.get(document.id)
-                if attempt is not None:
-                    if attempt.hash != item.hash or attempt.size != item.size:
-                        raise Conflict("batch_item_changed")
-                else:
-                    # Large dirty libraries use several bounded calls with the
-                    # same batch ID, all inside the original admission window.
-                    if now >= batch.started_at + timedelta(seconds=SYNC_WINDOW_SECONDS):
-                        raise ServiceError(
-                            "batch_sealed",
-                            "New documents must join within the batch admission window.",
-                            410,
-                        )
-                    revision = new_revision(document.revision)
-                    attempt = Attempt(
-                        document_id=document.id,
-                        revision=revision,
-                        batch=batch.id,
-                        base_revision=document.revision,
-                        size=item.size,
-                        hash=item.hash,
-                        expires_at=min(
-                            batch.expires_at, now + timedelta(seconds=self._seconds)
-                        ),
-                        result="issued",
-                        key=checkpoint_key(document.space, document.id, revision),
-                        state="issued",
-                        issued_at=now,
-                        published_at=None,
-                        refusals=0,
-                    )
-                    issued.append(attempt)
-                    attempts[document.id] = attempt
-            if issued:
-                ids = [attempt.document_id for attempt in issued]
-                revisions = [attempt.revision for attempt in issued]
-                session.execute(
-                    "insert into coordination.items(batch,document_id) select %s,unnest(%s::uuid[])",
-                    (batch.id, ids),
-                )
-                session.execute(
-                    """insert into documents.checkpoints(document_id,revision,key,state,issued_at)
-                    select document_id,revision,key,'issued',%s from unnest(%s::uuid[],%s::uuid[],%s::text[]) as slots(document_id,revision,key)""",
-                    (now, ids, revisions, [attempt.key for attempt in issued]),
-                )
-                session.execute(
-                    """insert into coordination.attempts(document_id,revision,batch,base_revision,size,hash,expires_at)
-                    select document_id,revision,%s,base_revision,size,hash,%s
-                    from unnest(%s::uuid[],%s::uuid[],%s::uuid[],%s::integer[],%s::text[])
-                    as slots(document_id,revision,base_revision,size,hash)""",
-                    (
-                        batch.id,
-                        issued[0].expires_at,
-                        ids,
-                        revisions,
-                        [attempt.base_revision for attempt in issued],
-                        [attempt.size for attempt in issued],
-                        [attempt.hash for attempt in issued],
-                    ),
-                )
             return BatchResponse(
-                id=batch.id,
-                started_at=batch.started_at,
-                expires_at=batch.expires_at,
+                id=state.batch.id,
+                started_at=state.batch.started_at,
+                expires_at=state.batch.expires_at,
                 documents=[
-                    self._slot(
-                        attempts[item.document_id], documents[item.document_id], now
-                    )
-                    for item in command.documents
+                    self._slot(item.attempt, item.document, state.now)
+                    for item in state.items
                 ],
             )
 
-    def retry(
-        self, account: Account, batch_id: UUID, document_id: UUID, command: RetryUpload
+    async def retry(
+        self, account: Actor, batch_id: UUID, document_id: UUID, command: RetryUpload
     ) -> UploadSlot:
         retired: Attempt | None = None
-        with self._database.transaction() as session:
-            batch = batch_for(session, account, batch_id, lock=True)
-            now = database_time(session)
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            batch = await batch_for(session, account, batch_id, lock=True)
+            now = await database_time(session)
             if now >= batch.expires_at:
                 raise ServiceError("batch_expired", "This batch has expired.", 410)
-            document = document_for(session, account, document_id, lock=True, edit=True)
-            current = attempt_for(session, batch.id, document.id)
+            document = await document_for(
+                session, account, document_id, lock=True, edit=True
+            )
+            current = await attempt_for(session, batch.id, document.id)
             if current is None:
                 raise NotFound()
             if current.refusals >= MAX_REFUSALS:
@@ -424,16 +358,20 @@ class SyncService:
             if command.base_revision != document.revision:
                 raise Conflict("base_revision_changed")
             if current.state == "issued":
-                session.execute(
-                    "update documents.checkpoints set state='pending' where document_id=%s and revision=%s",
-                    (document.id, current.revision),
+                (
+                    await session.execute(
+                        "update documents.checkpoints set state='pending' where document_id=%s and revision=%s",
+                        (document.id, current.revision),
+                    )
                 )
-                session.execute(
-                    "update coordination.attempts set result='replaced' where document_id=%s and revision=%s",
-                    (document.id, current.revision),
+                (
+                    await session.execute(
+                        "update coordination.attempts set result='replaced' where document_id=%s and revision=%s",
+                        (document.id, current.revision),
+                    )
                 )
                 retired = current
-            attempt = self._issue(
+            attempt = await self._issue(
                 session,
                 batch,
                 document,
@@ -444,12 +382,16 @@ class SyncService:
             )
             slot = self._slot(attempt, document, now)
         if retired is not None:
-            self.delete_pending([(retired.document_id, retired.revision, retired.key)])
+            (
+                await self.delete_pending(
+                    [(retired.document_id, retired.revision, retired.key)]
+                )
+            )
         return slot
 
-    def _uploaded(self, attempt: Attempt) -> bool:
+    async def _uploaded(self, attempt: Attempt) -> bool:
         try:
-            metadata = self._objects.head(attempt.key)
+            metadata = await self._objects.head(attempt.key)
         except ObjectMissing:
             return False
         return (
@@ -459,279 +401,102 @@ class SyncService:
             and metadata.metadata.get("sha256") == attempt.hash
         )
 
-    def _images_allowed(
-        self, session: Session, document_id: UUID, revision: UUID
-    ) -> bool:
-        # Aggregate in Postgres so even large staged manifests need one scalar
-        # result. Share locks serialize publication against image deletion.
-        rows = session.execute(
-            """with locked as materialized (
-            select i.id,i.account,i.deleted_at from public.images i
-            join coordination.images r on r.image_id=i.id
-            where r.document_id=%s and r.revision=%s order by i.id for share of i)
-            select count(*)=(select count(*) from coordination.images where document_id=%s and revision=%s)
-              and coalesce(bool_and(i.deleted_at is null and (
-                exists(select 1 from documents.images r where r.document_id=%s and r.image_id=i.id)
-                or exists(select 1 from documents.grants g where g.document_id=%s
-                  and g.account_id=i.account and g.role in ('owner','editor')))),true) as allowed
-            from locked i""",
-            (document_id, revision, document_id, revision, document_id, document_id),
-        )
-        return rows[0]["allowed"] is True
-
-    def _refuse(
-        self, session: Session, batch_id: UUID, refusals: list[tuple[Attempt, Refusal]]
-    ) -> None:
-        ids = [attempt.document_id for attempt, _ in refusals]
-        revisions = [attempt.revision for attempt, _ in refusals]
-        session.execute(
-            """update documents.checkpoints set state='pending'
-            where (document_id,revision) in(select * from unnest(%s::uuid[],%s::uuid[])) and state='issued'""",
-            (ids, revisions),
-        )
-        session.execute(
-            """update coordination.attempts a set result=refused.result from
-            unnest(%s::uuid[],%s::uuid[],%s::text[]) as refused(document_id,revision,result)
-            where a.document_id=refused.document_id and a.revision=refused.revision and a.result='issued'""",
-            (ids, revisions, [reason for _, reason in refusals]),
-        )
-        session.execute(
-            "update coordination.items set refusals=least(refusals+1,3) where batch=%s and document_id=any(%s::uuid[])",
-            (batch_id, ids),
-        )
-
-    def publish(
-        self, account: Account, batch_id: UUID, command: PublishBatch
+    async def publish(
+        self, account: Actor, batch_id: UUID, command: PublishBatch
     ) -> PublishResponse:
-        verified: dict[UUID, bool] = {}
+        items = command.model_dump(mode="json")["documents"]
+        async with self._database.read() as session:
+            account = await resolve_actor(session, account)
+            state = await operation(
+                session,
+                "publish_preflight",
+                (account.id, batch_id, json.dumps(items)),
+                _Preflight,
+            )
+        attempts = {item.document_id: item for item in state.attempts}
         to_verify: list[Attempt] = []
-        document_ids = [item.document_id for item in command.documents]
-        revisions = [item.revision for item in command.documents]
-        with self._database.transaction() as session:
-            batch_for(session, account, batch_id)
-            attempts = attempts_for(session, batch_id, document_ids, revisions)
-            permitted = {
-                UUID(str(row["id"]))
-                for row in session.execute(
-                    """select d.id from documents.documents d
-                    join documents.grants g on g.document_id=d.id
-                    where d.id=any(%s::uuid[]) and g.account_id=%s
-                    and g.role in ('owner','editor') and d.trashed_at is null""",
-                    (document_ids, account.id),
-                )
+        for item in command.documents:
+            attempt = attempts.get(item.document_id)
+            if (
+                attempt is None
+                or item.key != attempt.key
+                or item.base_revision != attempt.base_revision
+            ):
+                raise Conflict("upload_slot_mismatch")
+            if (
+                attempt.state == "issued"
+                and attempt.result == "issued"
+                and attempt.permitted
+            ):
+                to_verify.append(attempt)
+        verified = await bounded_map(self._uploaded, to_verify, limit=4)
+        by_revision = {
+            attempt.revision: value
+            for attempt, value in zip(to_verify, verified, strict=True)
+        }
+        payload = [
+            {
+                **item.model_dump(mode="json"),
+                "verified": by_revision.get(item.revision, False),
             }
-            for item in command.documents:
-                attempt = attempts.get(item.document_id)
-                if (
-                    attempt is None
-                    or item.key != attempt.key
-                    or item.base_revision != attempt.base_revision
-                ):
-                    raise Conflict("upload_slot_mismatch")
-                # No R2 request for an idempotent publication or a retired slot.
-                if (
-                    attempt.state == "issued"
-                    and attempt.result == "issued"
-                    and item.document_id in permitted
-                ):
-                    to_verify.append(attempt)
-        for attempt in to_verify:
-            verified[attempt.revision] = self._uploaded(attempt)
-
-        pending: list[tuple[UUID, UUID, str]] = []
-        outcomes: dict[UUID, PublishResult] = {}
-        published: list[Attempt] = []
-        refused: list[tuple[Attempt, Refusal]] = []
-        with self._database.transaction() as session:
-            batch = batch_for(session, account, batch_id, lock=True)
-            session.execute(
-                "select id from documents.documents where id=any(%s::uuid[]) order by id for update",
-                (document_ids,),
+            for item in command.documents
+        ]
+        async with self._database.transaction() as session:
+            account = await resolve_actor(session, account)
+            result = await operation(
+                session,
+                "publish_verified_batch",
+                (account.id, batch_id, json.dumps(payload)),
+                _Publication,
             )
-            session.execute(
-                """select document_id,revision from documents.checkpoints
-                where (document_id,revision) in(select * from unnest(%s::uuid[],%s::uuid[]))
-                order by document_id,revision for update""",
-                (document_ids, revisions),
+        outcomes = {
+            item.document_id: PublishResult(
+                document_id=item.document_id,
+                revision=item.revision,
+                result=item.result,
+                current=self.pointer(
+                    item.document,
+                    item.document.revision if item.result == "published" else None,
+                )
+                if item.document
+                else None,
+                retry_allowed=item.retry_allowed,
             )
-            now = database_time(session)
-            rows = session.execute(
-                """select d.*,g.role from documents.documents d
-                left join documents.grants g on g.document_id=d.id and g.account_id=%s
-                where d.id=any(%s::uuid[])""",
-                (account.id, document_ids),
-            )
-            documents = {UUID(str(row["id"])): row for row in rows}
-            attempts = attempts_for(session, batch.id, document_ids, revisions)
-            for item in sorted(command.documents, key=lambda item: item.document_id):
-                # Lock the document even if access was revoked, so disposal and
-                # grant changes cannot race a successful conditional update.
-                row = documents.get(item.document_id)
-                attempt = attempts.get(item.document_id)
-                if row is None or attempt is None:
-                    raise NotFound()
-                document = (
-                    Document.model_validate(row) if row["role"] is not None else None
-                )
-                allowed = (
-                    document is not None
-                    and document.role != "viewer"
-                    and document.trashed_at is None
-                )
-                reason: Refusal | None = None
-                if not allowed:
-                    reason = "forbidden"
-                elif attempt.published_at is not None:
-                    assert document is not None
-                    outcomes[item.document_id] = PublishResult(
-                        document_id=item.document_id,
-                        revision=item.revision,
-                        result="published",
-                        current=self.pointer(document, document.revision),
-                        retry_allowed=False,
-                    )
-                    continue
-                elif attempt.result != "issued" or attempt.state != "issued":
-                    reason = (
-                        attempt.result
-                        if attempt.result
-                        in {"conflict", "forbidden", "invalid", "expired"}
-                        else "expired"
-                    )
-                elif now >= batch.expires_at or now >= attempt.issued_at + timedelta(
-                    seconds=UPLOAD_TIMEOUT_SECONDS
-                ):
-                    reason = "expired"
-                else:
-                    self._stage_images(
-                        session, item.document_id, item.revision, item.images
-                    )
-                    if not verified.get(
-                        item.revision, False
-                    ) or not self._images_allowed(
-                        session, item.document_id, item.revision
-                    ):
-                        reason = "invalid"
-                if reason is None:
-                    moved = session.execute(
-                        """update documents.documents set revision=%s,key=%s,published_at=%s,updated_at=%s
-                            where id=%s and revision is not distinct from %s::uuid and trashed_at is null returning id""",
-                        (
-                            item.revision,
-                            item.key,
-                            now,
-                            now,
-                            item.document_id,
-                            item.base_revision,
-                        ),
-                    )
-                    if not moved:
-                        reason = "conflict"
-                if reason is not None:
-                    if attempt.state == "issued" and attempt.result == "issued":
-                        refused.append((attempt, reason))
-                        pending.append((item.document_id, item.revision, item.key))
-                        refusals = attempt.refusals + 1
-                    else:
-                        refusals = attempt.refusals
-                        if attempt.state == "pending":
-                            pending.append((item.document_id, item.revision, item.key))
-                    outcomes[item.document_id] = PublishResult(
-                        document_id=item.document_id,
-                        revision=item.revision,
-                        result=reason,
-                        current=self.pointer(document)
-                        if allowed and document is not None
-                        else None,
-                        retry_allowed=reason in {"conflict", "invalid"}
-                        and refusals < MAX_REFUSALS
-                        and now < batch.expires_at,
-                    )
-                    continue
-                published.append(attempt)
-                assert document is not None
-                updated = document.model_copy(
-                    update={
-                        "revision": item.revision,
-                        "key": item.key,
-                        "published_at": now,
-                        "updated_at": now,
-                    }
-                )
-                outcomes[item.document_id] = PublishResult(
-                    document_id=item.document_id,
-                    revision=item.revision,
-                    result="published",
-                    current=self.pointer(updated, updated.revision),
-                    retry_allowed=False,
-                )
-            if refused:
-                self._refuse(session, batch.id, refused)
-            if published:
-                ids = [attempt.document_id for attempt in published]
-                revs = [attempt.revision for attempt in published]
-                session.execute(
-                    """update documents.checkpoints set state='published',published_at=%s
-                    where (document_id,revision) in(select * from unnest(%s::uuid[],%s::uuid[]))""",
-                    (now, ids, revs),
-                )
-                session.execute(
-                    """update coordination.attempts set result='published'
-                    where (document_id,revision) in(select * from unnest(%s::uuid[],%s::uuid[]))""",
-                    (ids, revs),
-                )
-                session.execute(
-                    """insert into documents.images(document_id,image_id)
-                    select document_id,image_id from coordination.images
-                    where (document_id,revision) in(select * from unnest(%s::uuid[],%s::uuid[]))
-                    on conflict do nothing""",
-                    (ids, revs),
-                )
-                session.execute(
-                    """delete from coordination.images
-                    where (document_id,revision) in(select * from unnest(%s::uuid[],%s::uuid[]))""",
-                    (ids, revs),
-                )
-                retired = session.execute(
-                    """with ranked as (
-                    select document_id,revision,row_number() over(partition by document_id order by revision desc) as position
-                    from documents.checkpoints where document_id=any(%s::uuid[]) and state='published')
-                    update documents.checkpoints c set state='pending' from ranked r
-                    where c.document_id=r.document_id and c.revision=r.revision and r.position>%s
-                    returning c.document_id,c.revision,c.key""",
-                    (ids, CHECKPOINTS_RETAINED),
-                )
-                pending.extend(
-                    (row.document_id, row.revision, row.key)
-                    for row in [_Retired.model_validate(value) for value in retired]
-                )
-        cleanup_ok = self.delete_pending(pending)
+            for item in result.outcomes
+        }
+        cleanup_ok = await self.delete_pending(
+            [(item.document_id, item.revision, item.key) for item in result.pending]
+        )
         return PublishResponse(
             id=batch_id,
             documents=[outcomes[item.document_id] for item in command.documents],
             cleanup_pending=not cleanup_ok,
         )
 
-    def delete_pending(self, objects: list[tuple[UUID, UUID, str]]) -> bool:
-        complete = True
-        deleted: list[tuple[UUID, UUID]] = []
-        for document_id, revision, key in objects:
+    async def delete_pending(self, objects: list[tuple[UUID, UUID, str]]) -> bool:
+        async def remove(value: tuple[UUID, UUID, str]) -> tuple[UUID, UUID] | None:
             try:
-                self._objects.delete(key)
-                deleted.append((document_id, revision))
+                await self._objects.delete(value[2])
+                return value[0], value[1]
             except StorageUnavailable:
-                complete = False
+                return None
+
+        results = await bounded_map(remove, objects, limit=4)
+        complete = all(value is not None for value in results)
+        deleted = [value for value in results if value is not None]
         if deleted:
             try:
-                with self._database.transaction() as session:
-                    session.execute(
-                        """update documents.checkpoints set state='deleted'
+                async with self._database.transaction() as session:
+                    (
+                        await session.execute(
+                            """update documents.checkpoints set state='deleted'
                         where (document_id,revision) in(select * from unnest(%s::uuid[],%s::uuid[]))
                         and state='pending'""",
-                        (
-                            [value[0] for value in deleted],
-                            [value[1] for value in deleted],
-                        ),
+                            (
+                                [value[0] for value in deleted],
+                                [value[1] for value in deleted],
+                            ),
+                        )
                     )
             except Conflict, Unavailable:
                 complete = False
@@ -746,3 +511,35 @@ class _Retired(Record):
 
 class _Published(_Retired):
     published_at: AwareDatetime
+
+
+class _Reserved(Record):
+    document: Document
+    attempt: Attempt
+
+
+class _Reservation(Record):
+    batch: Batch
+    now: AwareDatetime
+    items: list[_Reserved]
+
+
+class _PreflightAttempt(Attempt):
+    permitted: bool | None
+
+
+class _Preflight(Record):
+    attempts: list[_PreflightAttempt]
+
+
+class _Outcome(Record):
+    document_id: UUID7
+    revision: UUID7
+    result: Literal["published", "conflict", "forbidden", "invalid", "expired"]
+    document: Document | None
+    retry_allowed: bool
+
+
+class _Publication(Record):
+    outcomes: list[_Outcome]
+    pending: list[_Retired]

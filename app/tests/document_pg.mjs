@@ -13,6 +13,7 @@ const encode = (_key, value) => value instanceof Uint8Array ? { $bytes: Buffer.f
 await db.exec(`create role anon nologin; create role authenticated nologin;`);
 if (!process.argv.includes("--empty")) {
   await db.exec(await Bun.file(new URL("../services/catalog/sql/20261115000100_catalog.sql", import.meta.url)).text());
+  await db.exec(await Bun.file(new URL("../services/catalog/sql/20261116000100_native.sql", import.meta.url)).text());
 }
 console.log(JSON.stringify({ ready: true }));
 for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {

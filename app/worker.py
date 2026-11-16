@@ -25,7 +25,7 @@ from app.services.async_database import RequestPostgresDatabase, Wait
 from app.services.limits import MAX_CONTROL_BODY_BYTES
 from app.services.storage.factory import Storage, signer
 from app.settings import Settings
-from app.state import AppResources, build_resources
+from app.state import AppResources, legacy_resources
 from app.worker_crypto import load_web_key
 from app.worker_storage import Buffer, R2Bucket, R2ImageBody, R2Objects
 
@@ -99,7 +99,7 @@ def resources_for(
         if persistence
         else None
     )
-    return build_resources(
+    return legacy_resources(
         settings,
         InlineExecutor(),
         database=database,
@@ -130,7 +130,16 @@ class RequestFactory(Protocol):
 _response = cast(ResponseFactory, Response)
 _request = cast(RequestFactory, Request)
 # Route/model construction is captured in Cloudflare's deployment snapshot.
-_application = create_app(BindingSettings())
+_shell_settings = BindingSettings()
+_application = create_app(
+    legacy_resources(
+        _shell_settings,
+        InlineExecutor(),
+        database=None,
+        storage=None,
+        authentication=build_authentication_service(_shell_settings),
+    )
+)
 _application.middleware_stack = _application.build_middleware_stack()
 # JSPI synchronous sockets are serialized as Cloudflare recommends for Python.
 _requests = asyncio.Lock()
@@ -236,7 +245,7 @@ class Default(WorkerEntrypoint):
             try:
                 if resources.cleanup is None:
                     raise RuntimeError("Cleanup requires both private R2 buckets")
-                result = await resources.executor.run(resources.cleanup.run)
+                result = await resources.cleanup.run()
                 if result.failures:
                     raise RuntimeError(
                         f"Cleanup left {result.failures} object deletes pending"

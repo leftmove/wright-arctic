@@ -13,6 +13,7 @@ from psycopg.conninfo import conninfo_to_dict
 from pydantic import TypeAdapter
 
 from app.dependencies import get_settings
+from app.services.catalog.migrations import migrate
 from app.services.database import PostgresSession, Session, verify_catalog
 from app.services.errors import ServiceError
 
@@ -76,7 +77,7 @@ def grant_runtime(session: Session, name: str, runtime_url: str | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("setup", "verify"))
+    parser.add_argument("command", choices=("setup", "migrate", "verify"))
     parser.add_argument("--grant-to", help="Private runtime login to provision")
     arguments = parser.parse_args()
     settings = get_settings()
@@ -104,6 +105,8 @@ def main() -> None:
                         if settings.documents_database_url is not None
                         else None,
                     )
+            if arguments.command == "migrate":
+                migrate(session)
             rows = session.execute(
                 "select statements from supabase_migrations.schema_migrations where version=%s",
                 (VERSION,),

@@ -1,29 +1,40 @@
 """Explicit service ownership for process and Worker request lifetimes."""
 
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field
 from functools import cached_property
 
 from starlette.types import Scope
 
+from app.authentication.errors import AuthenticationUnavailable
 from app.authentication.service import AuthenticationService
 from app.execution import Executor
 from app.services.cleanup import CleanupService
-from app.services.database import Database
+from app.services.database import AsyncDatabase, Database
 from app.services.documents.service import DocumentService
+from app.services.errors import ServiceError, Unavailable
 from app.services.identity.service import IdentityService
 from app.services.images.service import ImageService
 from app.services.storage.factory import Storage
+from app.services.storage.native import AsyncStorage
+from app.services.storage.objects import ObjectMissing
 from app.services.sync.service import SyncService
 from app.settings import Settings
+
+
+@dataclass
+class _Startup:
+    ready: bool = False
 
 
 @dataclass(frozen=True)
 class AppResources:
     settings: Settings
-    executor: Executor
     authentication: AuthenticationService | None = None
-    database: Database | None = None
-    storage: Storage | None = None
+    database: AsyncDatabase | None = None
+    storage: AsyncStorage | None = None
+    probes_dependencies: bool = False
+    _startup: _Startup = field(default_factory=_Startup, repr=False, compare=False)
 
     @cached_property
     def identity(self) -> IdentityService | None:
@@ -71,20 +82,55 @@ class AppResources:
             self.database, self.storage, trash_days=self.settings.trash_retention_days
         )
 
+    async def open(self) -> None:
+        if self.database is not None:
+            await self.database.open()
+        self._startup.ready = True
+
+    async def confirm_ready(self) -> None:
+        if self.probes_dependencies:
+            await self._probe_dependencies()
+            return
+        if (
+            not self._startup.ready
+            or self.database is None
+            or self.storage is None
+            or self.authentication is None
+        ):
+            raise Unavailable()
+
+    async def _probe_dependencies(self) -> None:
+        if self.settings.auth_issuer is None:
+            raise AuthenticationUnavailable()
+        if self.database is None:
+            raise Unavailable()
+        await self.database.open()
+        if self.storage is None:
+            raise ServiceError(
+                "storage_unconfigured", "Object storage is not configured.", 503
+            )
+        for objects, key in (
+            (self.storage.checkpoints, "documents/.readiness"),
+            (self.storage.images, "images/.readiness"),
+        ):
+            with suppress(ObjectMissing):
+                await objects.head(key)
+
     async def close(self) -> None:
+        self._startup.ready = False
         try:
             if self.authentication is not None:
                 await self.authentication.close()
         finally:
             try:
                 if self.storage is not None:
-                    await self.executor.run(self.storage.close)
+                    await self.storage.close()
             finally:
                 if self.database is not None:
-                    await self.executor.run(self.database.close)
+                    await self.database.close()
 
 
-def build_resources(
+def legacy_resources(
     settings: Settings,
     executor: Executor,
     *,
@@ -92,12 +138,35 @@ def build_resources(
     storage: Storage | None,
     authentication: AuthenticationService | None,
 ) -> AppResources:
+    adapted_database: AsyncDatabase | None = None
+    adapted_storage: AsyncStorage | None = None
+    if database is not None or storage is not None:
+        from app.services.compatibility import (
+            LegacyCheckpoints,
+            LegacyDatabase,
+            LegacyImages,
+        )
+
+        if database is not None:
+            adapted_database = LegacyDatabase(database, executor)
+        if storage is not None:
+
+            async def close_storage(bound: Storage = storage) -> None:
+                await executor.run(bound.close)
+
+            adapted_storage = AsyncStorage(
+                LegacyCheckpoints(storage.checkpoints, executor),
+                storage.checkpoint_signer,
+                LegacyImages(storage.images, executor),
+                storage.image_signer,
+                close_transport=close_storage,
+            )
     return AppResources(
         settings=settings,
-        executor=executor,
         authentication=authentication,
-        database=database,
-        storage=storage,
+        database=adapted_database,
+        storage=adapted_storage,
+        probes_dependencies=True,
     )
 
 

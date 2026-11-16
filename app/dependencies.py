@@ -1,17 +1,20 @@
 """Typed API dependencies; provider identities never substitute for account IDs."""
 
 import os
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 from functools import lru_cache
 from typing import Annotated, cast
 
 from fastapi import Depends, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from app.accounts import VerifiedActor
 from app.authentication.http import authenticate_request
-from app.services.database import Database
+from app.services.database import AsyncDatabase as Database
 from app.services.documents.service import DocumentService
 from app.services.errors import ServiceError, Unavailable
+from app.services.identity.actor import Actor
 from app.services.identity.service import IdentityService
 from app.services.images.service import ImageService
 from app.services.models import Account
@@ -37,14 +40,13 @@ _bearer = HTTPBearer(auto_error=False, scheme_name="NativeAccessToken")
 async def get_current_account(
     request: Request,
     _credential: Annotated[HTTPAuthorizationCredentials | None, Security(_bearer)],
-) -> Account:
+) -> Actor:
     existing = getattr(request.state, "resolved_account", None)
-    if isinstance(existing, Account):
+    if isinstance(existing, (Account, VerifiedActor)):
         return existing
     resources = request_resources(request)
     identity = await authenticate_request(request, resources.authentication)
-    service = require_identity_service(request)
-    account = await resources.executor.run(service.resolve, identity)
+    account = VerifiedActor(identity)
     request.state.resolved_account = account
     return account
 
@@ -54,9 +56,28 @@ async def request_settings(request: Request) -> Settings:
 
 
 async def execute[**P, T](
-    request: Request, function: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    request: Request,
+    function: Callable[P, Awaitable[T]],
+    *args: P.args,
+    **kwargs: P.kwargs,
 ) -> T:
-    return await request_resources(request).executor.run(function, *args, **kwargs)
+    work = asyncio.ensure_future(function(*args, **kwargs))
+
+    async def disconnect() -> None:
+        # Handlers call execute after request parsing, so this does not race
+        # control-body validation. Disconnect cancels awaited DB/HTTP work.
+        while True:
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                work.cancel()
+                return
+
+    watcher = asyncio.create_task(disconnect())
+    try:
+        return await work
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
 
 
 def require_database(request: Request) -> Database:
@@ -98,5 +119,5 @@ def require_sync_service(request: Request) -> SyncService:
     return value
 
 
-type AccountDep = Annotated[Account, Depends(get_current_account)]
+type AccountDep = Annotated[Actor, Depends(get_current_account)]
 type SettingsDep = Annotated[Settings, Depends(request_settings)]

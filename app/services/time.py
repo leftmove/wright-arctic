@@ -4,12 +4,12 @@ from datetime import datetime
 
 from pydantic import AwareDatetime, TypeAdapter
 
-from app.services.database import Session
+from app.services.database import AsyncSession as Session
 
 _timestamp = TypeAdapter(AwareDatetime)
 
 
-def database_time(session: Session) -> datetime:
+async def database_time(session: Session) -> datetime:
     return _timestamp.validate_python(
-        session.execute("select clock_timestamp() as now")[0]["now"]
+        (await session.execute("select clock_timestamp() as now"))[0]["now"]
     )

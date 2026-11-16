@@ -21,6 +21,7 @@ from app.services.images.service import ImageService
 from app.services.limits import MAX_IMAGE_BYTES
 from app.services.storage.objects import ImageObjects, ObjectMissing
 from app.services.storage.signing import S3Signer
+from app.tests import async_support
 from app.tests.document_database import FixtureDatabase
 
 
@@ -36,15 +37,19 @@ def verify(objects: ImageObjects, signer: S3Signer) -> dict[str, bool]:
     database = FixtureDatabase()
     keys: list[str] = []
     try:
-        account = IdentityService(database).resolve(
-            Identity(issuer="https://r2-conformance.invalid", subject=str(uuid7()))
+        account = async_support.run(
+            IdentityService(async_support.database(database)).resolve(
+                Identity(issuer="https://r2-conformance.invalid", subject=str(uuid7()))
+            )
         )
-        media = ImageService(database, objects, signer)
-        slot = media.issue(
-            account, IssueImage(id=uuid7(), size=len(payload), hash=digest)
+        media = ImageService(
+            async_support.database(database), async_support.images(objects), signer
         )
-        other = media.issue(
-            account, IssueImage(id=uuid7(), size=len(payload), hash=digest)
+        slot = async_support.run(
+            media.issue(account, IssueImage(id=uuid7(), size=len(payload), hash=digest))
+        )
+        other = async_support.run(
+            media.issue(account, IssueImage(id=uuid7(), size=len(payload), hash=digest))
         )
         keys.extend([slot.key, other.key])
         assert slot.upload is not None
@@ -113,7 +118,7 @@ def verify(objects: ImageObjects, signer: S3Signer) -> dict[str, bool]:
                 now=datetime.now(UTC) - timedelta(minutes=10),
             )
             require("expiry", client.get(expired.url), accepted=False)
-            confirmed = media.confirm(account, slot.id)
+            confirmed = async_support.run(media.confirm(account, slot.id))
             report["image_confirm_2mb"] = confirmed.size == MAX_IMAGE_BYTES
             read = signer.permission(slot.key, 60, method="GET")
             response = client.get(read.url)
