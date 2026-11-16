@@ -4,25 +4,16 @@ base_dir = "src"
 compatibility_date = "2026-11-08"
 compatibility_flags = ["python_workers", "python_shared_standard_library"]
 
-# The image pipeline uses JPEG XL and LittleCMS; Pillow handles input/WebP.
-# Keep the codec wheel's shared support, without uploading unrelated codecs.
 [python_modules]
 exclude = [
     "**/*.pyc",
     "**/__pycache__/**",
-    "imagecodecs/_bmp.*.so", "imagecodecs/_ccitt.*.so",
-    "imagecodecs/_czi.*.so", "imagecodecs/_deflate.*.so",
-    "imagecodecs/_htj2k.*.so", "imagecodecs/_jpeg2k.*.so",
-    "imagecodecs/_jpeg8.*.so", "imagecodecs/_jpegls.*.so",
-    "imagecodecs/_jpegxr.*.so", "imagecodecs/_lerc.*.so",
-    "imagecodecs/_ljpeg.*.so", "imagecodecs/_lz4.*.so",
-    "imagecodecs/_lzma.*.so", "imagecodecs/_pixarlog.*.so",
-    "imagecodecs/_png.*.so", "imagecodecs/_tiff.*.so",
-    "imagecodecs/_webp.*.so", "imagecodecs/_zlib.*.so",
-    "imagecodecs/_zstd.*.so",
-    "numpy/f2py/**", "numpy/_core/include/**", "numpy/_core/lib/**",
-    "numpy/testing/**", "numpy/_pyinstaller/**",
 ]
+
+[[r2_buckets]]
+binding = "DOCUMENTS"
+bucket_name = "wright-documents"
+remote = true
 
 [[r2_buckets]]
 binding = "IMAGES"
@@ -31,7 +22,7 @@ remote = true
 
 [[rules]]
 type = "Text"
-globs = ["app/services/documents/sqids.json", "app/assets/prompts/*.md"]
+globs = ["app/assets/prompts/*.md"]
 fallthrough = true
 
 [[hyperdrive]]
@@ -43,3 +34,7 @@ mode = "smart"
 
 [observability]
 enabled = true
+
+# Cleanup is bounded to sixteen exact-key deletions per invocation.
+[triggers]
+crons = ["*/5 * * * *"]

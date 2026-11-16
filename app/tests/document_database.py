@@ -18,9 +18,8 @@ from pathlib import Path
 from typing import IO, cast
 from uuid import UUID
 
-from app.services.documents.database import Row, Session
-from app.services.documents.errors import Conflict, Unavailable
-from app.services.documents.values import JsonParameter
+from app.services.database import Row, Session
+from app.services.errors import Conflict, Unavailable
 
 
 def _encode(value: object) -> object:
@@ -30,8 +29,6 @@ def _encode(value: object) -> object:
         return str(value)
     if isinstance(value, datetime):
         return value.isoformat()
-    if isinstance(value, JsonParameter):
-        return value.obj
     return value
 
 
@@ -123,7 +120,7 @@ class FixtureDatabase:
     @contextmanager
     def transaction(self) -> Iterator[Session]:
         with self.admin_transaction():
-            self.execute("set local role arctic_documents")
+            self.execute("set local role arctic_catalog")
             yield self
 
     @contextmanager

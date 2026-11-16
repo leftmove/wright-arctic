@@ -8,7 +8,7 @@ import httpx
 import jwt
 from pydantic import ValidationError
 
-from app.accounts import Account
+from app.accounts import Identity
 from app.authentication.errors import AuthenticationUnavailable, InvalidCredentials
 from app.authentication.jwks import SigningKeys
 from app.authentication.models import AccessClaims, TokenHeader
@@ -51,7 +51,7 @@ class AuthenticationService:
         """Release the public-key HTTP connection pool."""
         await self._client.aclose()
 
-    async def authenticate(self, token: str) -> Account:
+    async def authenticate(self, token: str) -> Identity:
         """Return identity only after signature, scope and time checks succeed."""
         if len(token) > _MAX_TOKEN_LENGTH or _COMPACT_JWT.fullmatch(token) is None:
             raise InvalidCredentials()
@@ -107,7 +107,7 @@ class AuthenticationService:
         ):
             raise InvalidCredentials()
         await self._check_policy(token)
-        return Account(id=claims.sub, issuer=claims.iss)
+        return Identity(subject=claims.sub, issuer=claims.iss)
 
     async def _check_policy(self, token: str) -> None:
         """Use the caller's exact token; no service key or subject delegation.

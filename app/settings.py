@@ -49,17 +49,26 @@ class Settings(BaseSettings):
     auth_algorithm: Literal["RS256", "ES256"] = "ES256"
     auth_max_token_lifetime_seconds: int = Field(default=900, ge=60, le=900)
     storage_endpoint_url: AnyHttpUrl | None = None
-    storage_region: str | None = None
-    storage_bucket: str | None = None
-    storage_access_key_id: SecretStr | None = Field(
+    storage_region: str = "auto"
+    documents_bucket: str = "wright-documents"
+    images_bucket: str = "wright-images"
+    documents_access_key_id: SecretStr | None = Field(
         default=None, exclude=True, repr=False
     )
-    storage_secret_access_key: SecretStr | None = Field(
+    documents_secret_access_key: SecretStr | None = Field(
         default=None, exclude=True, repr=False
     )
-    storage_public_base_url: AnyHttpUrl | None = None
+    images_access_key_id: SecretStr | None = Field(
+        default=None, exclude=True, repr=False
+    )
+    images_secret_access_key: SecretStr | None = Field(
+        default=None, exclude=True, repr=False
+    )
     storage_addressing_style: Literal["path", "virtual"] = "path"
-    storage_presign_seconds: int = Field(default=900, ge=60, le=604800)
+    storage_presign_seconds: int = Field(default=300, ge=30, le=900)
+    image_daily_quota: int = Field(default=100, ge=1, le=100)
+    image_total_quota: int = Field(default=300, ge=1, le=300)
+    trash_retention_days: int = Field(default=3, ge=1, le=365)
 
     @field_validator("auth_issuer")
     @classmethod
@@ -110,29 +119,33 @@ class Settings(BaseSettings):
                 )
         return self
 
-    @field_validator("storage_endpoint_url", "storage_public_base_url")
+    @field_validator("storage_endpoint_url")
     @classmethod
     def _storage_url_has_no_secrets(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
         if value is None:
             return None
         if value.username or value.password or value.query or value.fragment:
             raise ValueError("must not include credentials, a query, or a fragment")
+        if value.scheme != "https" and value.host not in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            raise ValueError(
+                "storage endpoints must use HTTPS outside local development"
+            )
         return value
 
-    @field_validator("storage_bucket")
+    @field_validator("documents_bucket", "images_bucket")
     @classmethod
-    def _storage_bucket_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
+    def _storage_bucket_name(cls, value: str) -> str:
         if not _valid_bucket_name(value):
             raise ValueError("must be a valid S3 bucket name")
         return value
 
     @field_validator("storage_region")
     @classmethod
-    def _storage_region_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
+    def _storage_region_name(cls, value: str) -> str:
         if _REGION_NAME.fullmatch(value) is None:
             raise ValueError("must be an S3 region such as auto or us-east-1")
         return value
@@ -141,25 +154,26 @@ class Settings(BaseSettings):
     def _storage_settings_are_complete(self) -> Self:
         configured = {
             "WRIGHT_ARCTIC_STORAGE_ENDPOINT_URL": self.storage_endpoint_url is not None,
-            "WRIGHT_ARCTIC_STORAGE_REGION": self.storage_region is not None,
-            "WRIGHT_ARCTIC_STORAGE_BUCKET": self.storage_bucket is not None,
-            "WRIGHT_ARCTIC_STORAGE_ACCESS_KEY_ID": _secret_configured(
-                self.storage_access_key_id
+            "WRIGHT_ARCTIC_DOCUMENTS_ACCESS_KEY_ID": _secret_configured(
+                self.documents_access_key_id
             ),
-            "WRIGHT_ARCTIC_STORAGE_SECRET_ACCESS_KEY": _secret_configured(
-                self.storage_secret_access_key
+            "WRIGHT_ARCTIC_DOCUMENTS_SECRET_ACCESS_KEY": _secret_configured(
+                self.documents_secret_access_key
+            ),
+            "WRIGHT_ARCTIC_IMAGES_ACCESS_KEY_ID": _secret_configured(
+                self.images_access_key_id
+            ),
+            "WRIGHT_ARCTIC_IMAGES_SECRET_ACCESS_KEY": _secret_configured(
+                self.images_secret_access_key
             ),
         }
         missing = [name for name, present in configured.items() if not present]
-        if self.storage_public_base_url is not None and missing:
-            raise ValueError(
-                "WRIGHT_ARCTIC_STORAGE_PUBLIC_BASE_URL requires " + ", ".join(missing)
-            )
         if missing and len(missing) != len(configured):
             raise ValueError(
-                "Image storage settings must be set together; missing "
-                + ", ".join(missing)
+                "Storage settings must be set together; missing " + ", ".join(missing)
             )
+        if self.documents_bucket == self.images_bucket:
+            raise ValueError("Documents and images require separate private buckets")
         return self
 
 

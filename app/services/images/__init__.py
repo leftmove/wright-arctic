@@ -1,5 +1,5 @@
-"""Image upload, compression, and object storage."""
+"""AVIF upload authorization and image delivery."""
 
-from app.services.images.service import ImageService, build_image_service
+from app.services.images.service import ImageService
 
-__all__ = ["ImageService", "build_image_service"]
+__all__ = ["ImageService"]

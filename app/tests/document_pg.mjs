@@ -10,11 +10,9 @@ const decode = value => {
   return value;
 };
 const encode = (_key, value) => value instanceof Uint8Array ? { $bytes: Buffer.from(value).toString("base64") } : typeof value === "bigint" ? String(value) : value;
-await db.exec(`create role anon nologin; create role authenticated nologin;
-  create schema auth; create table auth.users(id uuid primary key);
-  create table public.profiles(id uuid primary key references auth.users(id),username text not null unique);`);
+await db.exec(`create role anon nologin; create role authenticated nologin;`);
 if (!process.argv.includes("--empty")) {
-  await db.exec(await Bun.file(new URL("../services/documents/sql/20261107000600_documents.sql", import.meta.url)).text());
+  await db.exec(await Bun.file(new URL("../services/catalog/sql/20261115000100_catalog.sql", import.meta.url)).text());
 }
 console.log(JSON.stringify({ ready: true }));
 for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from app.services.database import PostgresDatabase
 from app.settings import Settings
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -188,17 +189,39 @@ def deploy() -> None:
     """Deploy a validated build and upload only the API's runtime settings."""
     if not (STAGE / "python_modules" / ".synced").exists():
         raise SystemExit("Run the worker build before deploying")
-    wrangler("deploy", authenticate=True)
+    # Validate local configuration before activating a bundle. Old or partial
+    # storage settings must never become a broken live Worker configuration.
+    settings = Settings()
+    if settings.documents_database_url is not None:
+        database = PostgresDatabase(settings.documents_database_url.get_secret_value())
+        try:
+            database.open()
+        finally:
+            database.close()
     runtime = runtime_settings()
+    with (ROOT / "wrangler.toml").open("rb") as stream:
+        bindings = tomllib.load(stream).get("hyperdrive", [])
+    for binding in bindings:
+        # Permissions and pointers require fresh reads after every mutation.
+        wrangler(
+            "hyperdrive",
+            "update",
+            binding["id"],
+            "--caching-disabled",
+            authenticate=True,
+        )
     if runtime:
         payload = STAGE / ".runtime-secrets.json"
         descriptor = os.open(payload, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             with os.fdopen(descriptor, "w") as stream:
                 json.dump(runtime, stream)
-            wrangler("secret", "bulk", str(payload), authenticate=True)
+            # Code and credentials must become live in the same version.
+            wrangler("deploy", "--secrets-file", str(payload), authenticate=True)
         finally:
             payload.unlink(missing_ok=True)
+    else:
+        wrangler("deploy", authenticate=True)
 
 
 def dev() -> None:

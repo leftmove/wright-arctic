@@ -1,210 +1,129 @@
-"""Image upload and retrieval."""
+"""Direct AVIF upload slots and authenticated streaming."""
 
+from collections.abc import AsyncIterator
 from typing import Annotated
-from uuid import UUID
 
-from fastapi import (
-    APIRouter,
-    FastAPI,
-    File,
-    Path,
-    Request,
-    Response,
-    UploadFile,
-    status,
-)
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Path, Query, Request, Response
+from fastapi.responses import StreamingResponse
+from pydantic import UUID7
 
 from app.dependencies import AccountDep, execute, require_image_service
-from app.schemas import ErrorResponse, ImageListResponse, ImageResponse, error_body
-from app.services.images.content import SOURCE_SHA256_PATTERN
-from app.services.images.errors import ImageServiceError
-from app.services.images.limits import MAX_STORED_BYTES, MAX_UPLOAD_BYTES
-from app.services.images.models import DeliveryFormat
+from app.schemas import ImageResponse, ImageUploadResponse, IssueImage
+from app.services.models import Image
+from app.services.storage.objects import ImageBody
 
-_UPLOAD_KIB = MAX_UPLOAD_BYTES // 1024
-_STORED_MIB = MAX_STORED_BYTES // (1024 * 1024)
-
-router = APIRouter(
-    prefix="/images",
-    tags=["images"],
-    responses={
-        status.HTTP_401_UNAUTHORIZED: {
-            "model": ErrorResponse,
-            "description": "A valid native access token is required.",
-        },
-        status.HTTP_502_BAD_GATEWAY: {
-            "model": ErrorResponse,
-            "description": "Object storage request failed.",
-        },
-        status.HTTP_503_SERVICE_UNAVAILABLE: {
-            "model": ErrorResponse,
-            "description": "Authentication or object storage is unavailable.",
-        },
-    },
-)
+router = APIRouter(prefix="/images", tags=["images"])
+avatars = APIRouter(prefix="/avatars", tags=["public avatars"])
 
 
-@router.post(
-    "",
-    status_code=status.HTTP_201_CREATED,
-    response_model=ImageResponse,
-    responses={
-        status.HTTP_400_BAD_REQUEST: {
-            "model": ErrorResponse,
-            "description": "The file is empty, unreadable, or cannot be decoded.",
-        },
-        status.HTTP_409_CONFLICT: {
-            "model": ErrorResponse,
-            "description": "The account has reached the image limit.",
-        },
-        status.HTTP_413_CONTENT_TOO_LARGE: {
-            "model": ErrorResponse,
-            "description": f"The upload is larger than {_UPLOAD_KIB} KiB.",
-        },
-        status.HTTP_415_UNSUPPORTED_MEDIA_TYPE: {
-            "model": ErrorResponse,
-            "description": "The file is not a supported still image.",
-        },
-    },
-)
-async def create_image(
-    account: AccountDep,
-    request: Request,
-    response: Response,
-    file: Annotated[
-        UploadFile,
-        File(
-            description=(
-                "JPEG, PNG, WebP, AVIF, or static GIF. "
-                f"Maximum upload size is {_UPLOAD_KIB} KiB. "
-                f"The stored object is at most {_STORED_MIB} MiB."
-            )
-        ),
-    ],
-) -> ImageResponse:
-    """Store a general-purpose image.
-
-    The upload is limited to 512 KiB. JPEG, PNG, WebP, AVIF, and static GIF are
-    normalized to sRGB, stripped of metadata and recompressed to JPEG XL. The stored
-    object is at most 1 MiB. Exact source bytes reuse the account's existing image,
-    including when its quota is full. Concurrent duplicates share one immutable
-    object. Each account can store 10 distinct images.
-    """
-    images = require_image_service(request)
-    image = await execute(request, images.create, account, file.file, file.size)
-    response.headers["Location"] = f"/images/{image.id}"
-    return image
+def _next(body: ImageBody) -> bytes | None:
+    return next(body.chunks, None)
 
 
-@router.get("", response_model=ImageListResponse)
-async def list_images(account: AccountDep, request: Request) -> ImageListResponse:
-    """List images stored for the account, oldest first."""
-    return await execute(request, require_image_service(request).list_images, account)
+async def _stream(request: Request, body: ImageBody) -> AsyncIterator[bytes]:
+    try:
+        while (chunk := await execute(request, _next, body)) is not None:
+            yield chunk
+    finally:
+        await execute(request, body.close)
 
 
-@router.get(
-    "/by-source/{source_sha256}",
-    response_model=ImageResponse,
-    responses={
-        status.HTTP_404_NOT_FOUND: {
-            "model": ErrorResponse,
-            "description": "These source bytes are not cached for this account.",
-        },
-    },
-)
-async def image_by_source(
-    source_sha256: Annotated[str, Path(pattern=SOURCE_SHA256_PATTERN)],
-    account: AccountDep,
-    request: Request,
-) -> ImageResponse:
-    """Reuse an exact image already uploaded by the verified account.
-
-    The digest is the lowercase SHA-256 of the original upload bytes. A miss
-    returns 404; uploading those bytes through POST /images populates the cache.
-    The response contains a fresh delivery URL, never a cached expiring URL.
-    """
-    return await execute(
-        request, require_image_service(request).get_by_source, account, source_sha256
-    )
-
-
-@router.put("/{image_id}/portrait", response_model=ImageResponse)
-async def import_portrait(
-    image_id: UUID,
-    account: AccountDep,
-    request: Request,
-    file: Annotated[UploadFile, File(description="Profile picture, at most 512 KiB.")],
-    format: DeliveryFormat = "webp",
-) -> ImageResponse:
-    """Import an immutable JPEG XL portrait and select a delivery format."""
-    return await execute(
-        request,
-        require_image_service(request).create,
-        account,
-        file.file,
-        file.size,
-        image_id=image_id,
-        portrait=True,
-        format=format,
-    )
-
-
-@router.get(
-    "/{image_id}",
-    response_model=ImageResponse,
-    responses={
-        status.HTTP_404_NOT_FOUND: {
-            "model": ErrorResponse,
-            "description": "The image is not stored for this account.",
-        },
-    },
-)
-async def read_image(
-    image_id: UUID,
-    account: AccountDep,
-    request: Request,
-    format: DeliveryFormat = "webp",
-) -> ImageResponse:
-    """Return one stored image and a URL that fetches its bytes."""
-    return await execute(
-        request,
-        require_image_service(request).get_image,
-        account,
-        image_id,
-        format=format,
-    )
-
-
-@router.delete(
-    "/{image_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    response_class=Response,
-    responses={
-        status.HTTP_404_NOT_FOUND: {
-            "model": ErrorResponse,
-            "description": "The image is not stored for this account.",
-        },
-    },
-)
-async def delete_image(
-    image_id: UUID, account: AccountDep, request: Request
+def _image_response(
+    request: Request, image: Image, body: ImageBody, *, public: bool = False
 ) -> Response:
-    """Delete one stored image belonging to the account."""
-    await execute(
-        request, require_image_service(request).delete_image, account, image_id
+    headers = {
+        "Content-Length": str(body.size),
+        "Content-Disposition": "inline",
+        "X-Content-Type-Options": "nosniff",
+        "ETag": '"' + image.hash + '"',
+    }
+    if public:
+        headers["Cache-Control"] = "public, max-age=300"
+    if request.scope.get("extensions", {}).get("wright.native_image_stream"):
+        # The Worker transfers the authorized R2 stream directly to its response.
+        # Routing, grants, validation, and cache headers still run through ASGI.
+        request.state.image_body = body
+        return Response(media_type="image/avif", headers=headers)
+    return StreamingResponse(
+        _stream(request, body), media_type="image/avif", headers=headers
     )
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-def install_image_error_handler(application: FastAPI) -> None:
-    """Render image failures as a stable code and message."""
-    application.add_exception_handler(ImageServiceError, _handle_image_error)
-
-
-async def _handle_image_error(_request: Request, exc: Exception) -> JSONResponse:
-    if not isinstance(exc, ImageServiceError):
-        raise exc
-    return JSONResponse(
-        status_code=exc.status_code, content=error_body(exc.code, exc.message)
+@router.post("/uploads", status_code=201)
+async def issue_image(
+    command: IssueImage, account: AccountDep, request: Request
+) -> ImageUploadResponse:
+    return await execute(
+        request, require_image_service(request).issue, account, command
     )
+
+
+@router.post("/{image_id}/confirm")
+async def confirm_image(
+    image_id: UUID7, account: AccountDep, request: Request
+) -> ImageResponse:
+    return await execute(
+        request, require_image_service(request).confirm, account, image_id
+    )
+
+
+@router.get("")
+async def list_images(
+    account: AccountDep,
+    request: Request,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+) -> list[ImageResponse]:
+    return await execute(
+        request,
+        require_image_service(request).list_images,
+        account,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/by-hash/{digest}")
+async def by_hash(
+    digest: Annotated[str, Path(pattern=r"^[0-9a-f]{64}$")],
+    account: AccountDep,
+    request: Request,
+) -> ImageResponse:
+    return await execute(
+        request, require_image_service(request).by_hash, account, digest
+    )
+
+
+@router.get("/{image_id}")
+async def image_metadata(
+    image_id: UUID7, account: AccountDep, request: Request
+) -> ImageResponse:
+    return await execute(
+        request, require_image_service(request).metadata, account, image_id
+    )
+
+
+@router.get("/{image_id}/content", response_class=StreamingResponse)
+async def image_content(
+    image_id: UUID7, account: AccountDep, request: Request
+) -> Response:
+    image, body = await execute(
+        request, require_image_service(request).content, account, image_id
+    )
+    return _image_response(request, image, body)
+
+
+@router.delete("/{image_id}", status_code=204)
+async def delete_image(
+    image_id: UUID7, account: AccountDep, request: Request
+) -> Response:
+    await execute(request, require_image_service(request).delete, account, image_id)
+    return Response(status_code=204)
+
+
+@avatars.get("/{account_id}", response_class=StreamingResponse)
+async def public_avatar(account_id: UUID7, request: Request) -> Response:
+    image, body = await execute(
+        request, require_image_service(request).avatar, account_id
+    )
+    return _image_response(request, image, body, public=True)

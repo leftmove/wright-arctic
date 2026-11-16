@@ -2,6 +2,14 @@
 
 from starlette.types import Scope
 
+PROTECTED_PREFIXES = ("/documents", "/sync", "/spaces", "/images", "/account")
+
+
+def protected_path(path: str) -> bool:
+    return any(
+        path == prefix or path.startswith(prefix + "/") for prefix in PROTECTED_PREFIXES
+    )
+
 
 def route_path(scope: Scope) -> str:
     """Match router paths under mounts and reverse-proxy root paths alike.

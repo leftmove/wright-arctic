@@ -1,22 +1,32 @@
-"""Validated API response contracts."""
+"""Public metadata and capability contracts. Document content is never an API body."""
 
-from datetime import datetime
-from typing import Annotated, Literal
-from uuid import UUID
+from typing import Annotated, Literal, Self
 
 from pydantic import (
-    AnyHttpUrl,
+    UUID7,
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
-    JsonValue,
-    field_validator,
+    model_validator,
 )
+
+from app.services.limits import (
+    MAX_BATCH_ITEMS,
+    MAX_CHECKPOINT_BYTES,
+    MAX_IMAGE_BYTES,
+)
+from app.services.models import Role
+
+type EntityId = Annotated[UUID7, Field(strict=False)]
+type Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 class ResponseModel(BaseModel):
-    """Use explicit, immutable response contracts without implicit coercion."""
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+
+class Command(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
@@ -40,135 +50,183 @@ class ErrorResponse(ResponseModel):
     message: str
 
 
-class ImageSummary(ResponseModel):
-    id: UUID
-    media_type: Literal["image/jxl", "image/avif", "image/webp"]
-    byte_size: int = Field(ge=1)
-    url: AnyHttpUrl
-    url_expires_in: int | None = Field(
-        default=None,
-        ge=1,
-        description="Seconds until url stops working. Null when url does not expire.",
-    )
-    created_at: datetime
-
-    @field_validator("created_at")
-    @classmethod
-    def _created_at_is_aware(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
-            raise ValueError("created_at must be timezone-aware")
-        return value
-
-
-class ImageResponse(ImageSummary):
-    width: int = Field(ge=1)
-    height: int = Field(ge=1)
-
-
-class ImageListResponse(ResponseModel):
-    images: list[ImageSummary]
-
-
-class PortraitSelection(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    image_id: UUID = Field(strict=False)
-    if_absent: bool = False
-
-
 def error_body(code: str, message: str) -> dict[str, str]:
-    """Return the JSON object used for image API failures."""
-    payload = ErrorResponse(code=code, message=message)
-    return {"code": payload.code, "message": payload.message}
+    return {"code": code, "message": message}
 
 
-class DocumentCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-    operation_id: UUID = Field(strict=False)
+class AccountResponse(ResponseModel):
+    id: UUID7
+    avatar_id: UUID7 | None
+    last_sync: AwareDatetime | None
+    created_at: AwareDatetime
 
 
-class UploadDocument(DocumentCommand):
+class AvatarSelection(Command):
+    image_id: EntityId | None
+
+
+class SpaceResponse(ResponseModel):
+    id: UUID7
+    owner: UUID7
+    created_at: AwareDatetime
+
+
+class CreateSpace(Command):
+    id: EntityId
+
+
+class CreateDocument(Command):
+    id: EntityId
+    space: EntityId
+    title: str = Field(default="Untitled", max_length=255)
+
+
+class RenameDocument(Command):
     title: str = Field(max_length=255)
-    title_is_user_set: bool
-    format_version: Literal[1] = 1
-    schema_name: Literal["basic", "wright-rich-text"] = "wright-rich-text"
-    schema_version: Literal[1] = 1
-
-
-class CreateDocument(DocumentCommand):
-    schema_name: Literal["basic", "wright-rich-text"] = "wright-rich-text"
-    title: str | None = Field(default=None, max_length=255)
-    content: dict[str, JsonValue] | None = None
-
-
-class AppendDocuments(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-    operations: list[Annotated[UUID, Field(strict=False)]] = Field(
-        min_length=1, max_length=128
-    )
-
-
-class RenameDocument(DocumentCommand):
-    expected_metadata_seq: int = Field(ge=0)
-    title: str | None = Field(default=None, max_length=255)
-
-
-class ShareDocument(DocumentCommand):
-    user_id: UUID | None = Field(default=None, strict=False)
-    role: Literal["editor", "viewer"] | None = None
-
-
-class GrantDocument(DocumentCommand):
-    role: Literal["editor", "viewer"] | None
-
-
-class RestoreDocument(DocumentCommand):
-    through_seq: int = Field(ge=0)
 
 
 class DocumentSummary(ResponseModel):
-    id: UUID
-    space_id: UUID
+    id: UUID7
+    space: UUID7
     title: str
-    title_is_user_set: bool
-    format_version: int
-    schema_name: str
-    schema_version: int
-    head_seq: int
-    metadata_seq: int
-    access_version: int
-    role: Literal["owner", "editor", "viewer"]
-    created_at: datetime
-    updated_at: datetime
-    trashed_at: datetime | None
-    path: str
+    trashed_at: AwareDatetime | None
+    revision: UUID7 | None
+    key: str | None
+    published_at: AwareDatetime | None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    role: Role
 
 
-class DocumentReceipt(ResponseModel):
-    document_id: UUID
-    space_id: UUID
-    operation_id: UUID
-    head_seq: int
-    path: str | None = None
-
-
-class DocumentContent(ResponseModel):
-    document: DocumentSummary
-    content: JsonValue
+class GrantDocument(Command):
+    role: Literal["editor", "viewer"]
 
 
 class DocumentGrant(ResponseModel):
-    user_id: UUID
-    role: Literal["editor", "viewer"]
-    granted_by: UUID
-    granted_at: datetime
+    document_id: UUID7
+    account_id: UUID7
+    role: Role
 
 
-class DocumentChange(ResponseModel):
-    seq: int
-    operation_id: UUID
-    actor_user_id: UUID
-    source: str
-    kind: str
-    metadata: dict[str, JsonValue]
-    recorded_at: datetime
+class Permission(ResponseModel):
+    method: Literal["GET", "PUT"]
+    url: str
+    headers: dict[str, str]
+    expires_at: AwareDatetime
+
+
+class Pointer(ResponseModel):
+    document_id: UUID7
+    revision: UUID7 | None
+    key: str | None
+    published_at: AwareDatetime | None
+    read: Permission | None
+
+
+class CheckpointUpload(Command):
+    document_id: EntityId
+    size: int = Field(ge=1, le=MAX_CHECKPOINT_BYTES)
+    hash: Sha256
+
+
+class StartBatch(Command):
+    id: EntityId
+    documents: list[CheckpointUpload] = Field(min_length=1, max_length=MAX_BATCH_ITEMS)
+
+    @model_validator(mode="after")
+    def _unique_documents(self) -> Self:
+        if len({item.document_id for item in self.documents}) != len(self.documents):
+            raise ValueError("Each document may appear once per request")
+        return self
+
+
+class RetryUpload(Command):
+    previous_revision: EntityId
+    base_revision: EntityId | None
+    size: int = Field(ge=1, le=MAX_CHECKPOINT_BYTES)
+    hash: Sha256
+
+
+class UploadSlot(ResponseModel):
+    document_id: UUID7
+    current: Pointer
+    base_revision: UUID7 | None
+    revision: UUID7
+    key: str
+    upload: Permission | None
+    refusals: int
+    result: Literal[
+        "issued", "published", "conflict", "forbidden", "invalid", "expired", "replaced"
+    ]
+
+
+class BatchResponse(ResponseModel):
+    id: UUID7
+    started_at: AwareDatetime
+    expires_at: AwareDatetime
+    documents: list[UploadSlot]
+
+
+class ImageReferences(Command):
+    images: list[EntityId] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _unique_images(self) -> Self:
+        if len(set(self.images)) != len(self.images):
+            raise ValueError("Image identifiers must be unique")
+        return self
+
+
+class PublishItem(ImageReferences):
+    document_id: EntityId
+    base_revision: EntityId | None
+    revision: EntityId
+    key: str = Field(min_length=1, max_length=160)
+
+
+class PublishBatch(Command):
+    documents: list[PublishItem] = Field(min_length=1, max_length=MAX_BATCH_ITEMS)
+
+    @model_validator(mode="after")
+    def _unique_documents(self) -> Self:
+        if len({item.document_id for item in self.documents}) != len(self.documents):
+            raise ValueError("Each document may appear once per request")
+        return self
+
+
+class PublishResult(ResponseModel):
+    document_id: UUID7
+    revision: UUID7
+    result: Literal["published", "conflict", "forbidden", "invalid", "expired"]
+    current: Pointer | None
+    retry_allowed: bool
+
+
+class PublishResponse(ResponseModel):
+    id: UUID7
+    documents: list[PublishResult]
+    cleanup_pending: bool
+
+
+class IssueImage(Command):
+    id: EntityId
+    size: int = Field(ge=1, le=MAX_IMAGE_BYTES)
+    hash: Sha256
+    media_type: Literal["image/avif"] = "image/avif"
+
+
+class ImageResponse(ResponseModel):
+    id: UUID7
+    account: UUID7
+    size: int
+    hash: str
+    created_at: AwareDatetime
+    media_type: Literal["image/avif"] = "image/avif"
+    url: str
+
+
+class ImageUploadResponse(ResponseModel):
+    id: UUID7
+    key: str
+    upload: Permission | None
+    image: ImageResponse | None

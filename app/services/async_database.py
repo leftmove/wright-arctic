@@ -1,18 +1,18 @@
 """Request-owned asyncpg connections bridged into the synchronous domain service."""
 
 import importlib
-import json
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Protocol, cast
 
-from app.services.documents.database import (
+from app.services.database import (
+    TRANSACTION_SETTINGS,
     Row,
     Session,
     raise_database_error,
-    verify_session,
+    verify_catalog,
+    verify_role,
 )
-from app.services.documents.values import JsonParameter
 
 
 class Wait(Protocol):
@@ -26,20 +26,12 @@ class Transaction(Protocol):
 
 
 class Connection(Protocol):
+    def execute(self, query: str) -> Awaitable[str]: ...
     def fetch(
         self, query: str, *parameters: object
     ) -> Awaitable[Sequence[Mapping[str, object]]]: ...
-    def transaction(self) -> Transaction: ...
+    def transaction(self, *, isolation: str) -> Transaction: ...
     def close(self, *, timeout: float) -> Awaitable[None]: ...
-    def set_type_codec(
-        self,
-        name: str,
-        *,
-        schema: str,
-        encoder: Callable[[object], str],
-        decoder: Callable[[str], object],
-        format: str,
-    ) -> Awaitable[None]: ...
 
 
 class Driver(Protocol):
@@ -82,8 +74,8 @@ class RequestPostgresDatabase:
         self._verified = False
 
     def open(self) -> None:
-        with self.transaction():
-            pass
+        with self.transaction() as session:
+            verify_catalog(session)
 
     def close(self) -> None:
         if self._connection is not None:
@@ -96,26 +88,15 @@ class RequestPostgresDatabase:
         try:
             if self._connection is None:
                 self._connection = self._wait(
-                    self._driver.connect(self._url, timeout=5, statement_cache_size=0)
+                    self._driver.connect(self._url, timeout=5, statement_cache_size=100)
                 )
-                for name in ("json", "jsonb"):
-                    self._wait(
-                        self._connection.set_type_codec(
-                            name,
-                            schema="pg_catalog",
-                            encoder=_json,
-                            decoder=json.loads,
-                            format="text",
-                        )
-                    )
-            transaction = self._connection.transaction()
+            transaction = self._connection.transaction(isolation="read_committed")
             self._wait(transaction.start())
             try:
                 session = AsyncPostgresSession(self._connection, self._wait)
-                session.execute("set local statement_timeout='15s'")
-                session.execute("set local lock_timeout='5s'")
+                self._wait(self._connection.execute(TRANSACTION_SETTINGS))
                 if not self._verified:
-                    verify_session(session)
+                    verify_role(session)
                     self._verified = True
                 yield session
             except BaseException:
@@ -131,9 +112,3 @@ class RequestPostgresDatabase:
         ) as error:
             state: object = getattr(error, "sqlstate", None)
             raise_database_error(state if isinstance(state, str) else None)
-
-
-def _json(value: object) -> str:
-    return json.dumps(
-        value.obj if isinstance(value, JsonParameter) else value, allow_nan=False
-    )

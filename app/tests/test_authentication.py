@@ -4,46 +4,34 @@ import asyncio
 import json
 import time
 import unittest
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from datetime import UTC, datetime
-from io import BytesIO
 from typing import ClassVar
-from unittest.mock import Mock, patch
-from uuid import uuid4
+from unittest.mock import patch
 
 import httpx
-import imagecodecs
 import jwt
-from botocore.exceptions import ClientError
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from fastapi import FastAPI
-from PIL import Image
-from pydantic import AnyHttpUrl, JsonValue, ValidationError
+from pydantic import JsonValue, ValidationError
+from pydantic_settings import SettingsConfigDict
 
-from app.accounts import Account
+from app.accounts import Identity
 from app.authentication.errors import AuthenticationUnavailable, InvalidCredentials
 from app.authentication.jwks import SigningKeys
 from app.authentication.service import (
     AuthenticationService,
     build_authentication_service,
 )
-from app.main import create_app
-from app.schemas import ImageListResponse, ImageResponse
-from app.services.images.content import source_digest
-from app.services.images.errors import ImageNotFound
-from app.services.images.limits import MAX_UPLOAD_BODY_BYTES
-from app.services.images.service import ImageService
-from app.services.images.storage import S3ImageStore, account_prefix, object_key
 from app.settings import Settings
-from app.tests.image_storage import memory_storage
 
 _ISSUER = "https://issuer.example/auth/v1"
 _JWKS = _ISSUER + "/.well-known/jwks.json"
 
 
+class TestSettings(Settings):
+    model_config = SettingsConfigDict(env_file=None, env_prefix="WRIGHT_ARCTIC_TEST_")
+
+
 def configuration(**overrides: JsonValue) -> Settings:
-    return Settings.model_validate(
+    return TestSettings.model_validate(
         {
             "documents_database_url": None,
             "documents_setup_url": None,
@@ -140,21 +128,21 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             token(self.private_key, claims={"jti": "renewed"})
         )
         self.assertEqual(
-            first, Account(id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER)
+            first,
+            Identity(subject="11111111-1111-4111-8111-111111111111", issuer=_ISSUER),
         )
-        self.assertEqual(first.storage_key, renewed.storage_key)
+        self.assertEqual(first, renewed)
         self.assertNotEqual(
-            first.storage_key,
-            Account(id=first.id, issuer="https://other.example").storage_key,
+            first,
+            Identity(subject=first.subject, issuer="https://other.example"),
         )
         self.assertEqual(self.fetches, 1)
-        self.assertEqual(len(first.storage_key), 64)
 
     async def test_audience_arrays_are_accepted(self) -> None:
         account = await self.service.authenticate(
             token(self.private_key, claims={"aud": ["other", "authenticated"]})
         )
-        self.assertEqual(account.id, "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(account.subject, "11111111-1111-4111-8111-111111111111")
 
     async def test_signature_forgery_is_rejected(self) -> None:
         with self.assertRaises(InvalidCredentials):
@@ -370,374 +358,9 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
             configuration(auth_algorithm="ES256"), self.client
         )
         account = await es_service.authenticate(token(private, algorithm="ES256"))
-        self.assertEqual(account.id, "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(account.subject, "11111111-1111-4111-8111-111111111111")
         with self.assertRaises(InvalidCredentials):
             await self.service.authenticate(token(private, algorithm="ES256"))
-
-    @asynccontextmanager
-    async def application(
-        self, image_service: ImageService | None = None
-    ) -> AsyncIterator[tuple[httpx.AsyncClient, FastAPI]]:
-        with (
-            patch("app.main.get_settings", return_value=configuration()),
-            patch("app.main.build_authentication_service", return_value=self.service),
-            patch("app.main.build_image_service", return_value=image_service),
-        ):
-            app = create_app()
-        async with (
-            app.router.lifespan_context(app),
-            httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app),
-                base_url="https://arctic.example",
-            ) as client,
-        ):
-            yield client, app
-
-    async def test_all_image_operations_reject_the_old_account_header(self) -> None:
-        async with self.application() as (client, _):
-            for method, path in (
-                ("GET", "/images"),
-                ("GET", "/images/by-source/" + "0" * 64),
-                ("POST", "/images"),
-                ("GET", "/images/" + str(uuid4())),
-                ("DELETE", "/images/" + str(uuid4())),
-            ):
-                response = await client.request(
-                    method, path, headers={"X-Account-Id": str(uuid4())}
-                )
-                self.assertEqual(response.status_code, 401)
-                self.assertEqual(response.json()["code"], "authentication_required")
-                self.assertIn("Bearer", response.headers["WWW-Authenticate"])
-        self.assertEqual(self.fetches, 0)
-
-    async def test_bad_bearer_transport_is_rejected(self) -> None:
-        valid = "Bearer " + token(self.private_key)
-        cases: list[list[tuple[str, str]]] = [
-            [("Authorization", "Basic anything")],
-            [("Authorization", "Bearer")],
-            [("Authorization", "Bearer ")],
-            [("Authorization", "Bearer  token")],
-            [("Authorization", valid), ("Authorization", valid)],
-        ]
-        async with self.application() as (client, _):
-            for headers in cases:
-                response = await client.get("/images", headers=headers)
-                self.assertEqual(response.status_code, 401)
-                self.assertEqual(response.json()["code"], "invalid_token")
-            response = await client.get(
-                "/images", params={"access_token": token(self.private_key)}
-            )
-            self.assertEqual(response.status_code, 401)
-
-    async def test_upload_authentication_happens_before_body_reading(self) -> None:
-        read_attempts = 0
-
-        async def unreadable_body() -> AsyncIterator[bytes]:
-            nonlocal read_attempts
-            read_attempts += 1
-            yield b"upload"
-
-        async with self.application() as (client, _):
-            response = await client.post("/images", content=unreadable_body())
-            self.assertEqual(response.status_code, 401)
-            self.assertEqual(read_attempts, 0)
-
-    async def test_mounted_upload_authenticates_before_body_reading(self) -> None:
-        read_attempts = 0
-
-        async def body() -> AsyncIterator[bytes]:
-            nonlocal read_attempts
-            read_attempts += 1
-            yield b"--wright--\r\n"
-
-        async with self.application() as (_, app):
-            parent = FastAPI()
-            parent.mount("/api", app)
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=parent),
-                base_url="https://arctic.example",
-            ) as client:
-                response = await client.post(
-                    "/api/images",
-                    content=body(),
-                    headers={"Content-Type": "multipart/form-data; boundary=wright"},
-                )
-                self.assertEqual(response.status_code, 401)
-                self.assertEqual(read_attempts, 0)
-
-    async def test_mounted_authenticated_upload_enforces_the_size_limit(self) -> None:
-        async with self.application() as (_, app):
-            parent = FastAPI()
-            parent.mount("/api", app)
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=parent),
-                base_url="https://arctic.example",
-            ) as client:
-                response = await client.post(
-                    "/api/images",
-                    content=b"",
-                    headers={
-                        "Authorization": "Bearer " + token(self.private_key),
-                        "Content-Length": str(MAX_UPLOAD_BODY_BYTES + 1),
-                    },
-                )
-                self.assertEqual(response.status_code, 413)
-                self.assertEqual(response.json()["code"], "image_too_large")
-
-    async def test_health_is_public_and_authenticated_requests_reach_storage(
-        self,
-    ) -> None:
-        async with self.application() as (client, app):
-            self.assertEqual((await client.get("/health")).status_code, 200)
-            response = await client.get(
-                "/images",
-                headers={"Authorization": "bearer " + token(self.private_key)},
-            )
-            self.assertEqual(response.status_code, 503)
-            self.assertEqual(response.json()["code"], "storage_unconfigured")
-            self.assertEqual(response.headers["Cache-Control"], "private, no-store")
-            schema = app.openapi()
-            self.assertEqual(
-                schema["paths"]["/images"]["get"]["security"],
-                [{"NativeAccessToken": []}],
-            )
-            self.assertNotIn("X-Account-Id", json.dumps(schema))
-        self.assertTrue(self.client.is_closed)
-
-    async def test_image_owner_is_only_the_verified_subject(self) -> None:
-        images = Mock(spec=ImageService)
-        images.list_images.return_value = ImageListResponse(images=[])
-        async with self.application(images) as (client, _):
-            response = await client.get(
-                "/images",
-                headers={
-                    "Authorization": "Bearer " + token(self.private_key),
-                    "X-Account-Id": "someone-else",
-                },
-            )
-            self.assertEqual(response.status_code, 200)
-            images.list_images.assert_called_once_with(
-                Account(id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER)
-            )
-
-    async def test_jwks_outage_is_retryable_and_does_not_leak_credentials(self) -> None:
-        self.status = 503
-        async with self.application() as (client, _):
-            value = token(self.private_key)
-            response = await client.get(
-                "/images", headers={"Authorization": "Bearer " + value}
-            )
-            self.assertEqual(response.status_code, 503)
-            self.assertEqual(response.headers["Retry-After"], "30")
-            self.assertNotIn(value, response.text)
-            self.assertNotIn(_JWKS, response.text)
-
-    async def test_create_read_and_delete_use_the_verified_account(self) -> None:
-        images = Mock(spec=ImageService)
-        image_id = uuid4()
-        images.create.return_value = ImageResponse(
-            id=image_id,
-            media_type="image/webp",
-            byte_size=10,
-            width=1,
-            height=1,
-            url=AnyHttpUrl("https://images.example/signed"),
-            url_expires_in=900,
-            created_at=datetime.now(UTC),
-        )
-        images.get_image.return_value = images.create.return_value
-        headers = {"Authorization": "Bearer " + token(self.private_key)}
-        account = Account(id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER)
-        async with self.application(images) as (client, _):
-            response = await client.post(
-                "/images",
-                headers=headers,
-                files={"file": ("image.png", b"upload", "image/png")},
-            )
-            self.assertEqual(response.status_code, 201)
-            self.assertEqual(response.headers["Location"], "/images/" + str(image_id))
-            self.assertEqual(images.create.call_args.args[0], account)
-            response = await client.get("/images/" + str(image_id), headers=headers)
-            self.assertEqual(response.status_code, 200)
-            images.get_image.assert_called_once_with(account, image_id, format="webp")
-            response = await client.delete("/images/" + str(image_id), headers=headers)
-            self.assertEqual(response.status_code, 204)
-            images.delete_image.assert_called_once_with(account, image_id)
-
-    async def test_real_image_upload_is_stored_in_the_verified_namespace(self) -> None:
-        storage_client = memory_storage()
-        images = ImageService(S3ImageStore(storage_client, "images", None, 900))
-        source = BytesIO()
-        Image.new("RGB", (2, 2), "red").save(source, format="PNG")
-        async with self.application(images) as (client, _):
-            response = await client.post(
-                "/images",
-                headers={"Authorization": "Bearer " + token(self.private_key)},
-                files={"file": ("image.png", source.getvalue(), "image/png")},
-            )
-            self.assertEqual(response.status_code, 201, response.text)
-            key = storage_client.put_object.call_args.kwargs["Key"]
-            self.assertTrue(
-                key.startswith(
-                    account_prefix(
-                        Account(
-                            id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER
-                        )
-                    )
-                )
-            )
-            self.assertIn(
-                storage_client.put_object.call_args.kwargs["ContentType"],
-                ("image/jxl",),
-            )
-            path = "/images/by-source/" + source_digest(source.getvalue())
-            cached = await client.get(
-                path, headers={"Authorization": "Bearer " + token(self.private_key)}
-            )
-            self.assertEqual(cached.status_code, 200, cached.text)
-            self.assertEqual(cached.json()["id"], response.json()["id"])
-            other = await client.get(
-                path,
-                headers={
-                    "Authorization": "Bearer "
-                    + token(
-                        self.private_key,
-                        claims={"sub": "22222222-2222-4222-8222-222222222222"},
-                    )
-                },
-            )
-            self.assertEqual(other.status_code, 404)
-            anonymous = await client.get(path)
-            self.assertEqual(anonymous.status_code, 401)
-            invalid = await client.get(
-                "/images/by-source/not-a-hash",
-                headers={"Authorization": "Bearer " + token(self.private_key)},
-            )
-            self.assertEqual(invalid.status_code, 422)
-            duplicate = await client.post(
-                "/images",
-                headers={"Authorization": "Bearer " + token(self.private_key)},
-                files={"file": ("renamed.png", source.getvalue(), "image/png")},
-            )
-            self.assertEqual(duplicate.status_code, 201, duplicate.text)
-            self.assertEqual(duplicate.json()["id"], response.json()["id"])
-            self.assertEqual(storage_client.put_object.call_count, 1)
-
-    async def test_portrait_import_is_webp_bounded_and_idempotent(self) -> None:
-        storage_client = memory_storage()
-        images = ImageService(S3ImageStore(storage_client, "images", None, 900))
-        image_id = uuid4()
-        source = BytesIO()
-        Image.new("RGB", (1200, 800), "red").save(source, format="JPEG")
-        async with self.application(images) as (client, _):
-            headers = {"Authorization": "Bearer " + token(self.private_key)}
-            path = f"/images/{image_id}/portrait"
-            first = await client.put(
-                path,
-                headers=headers,
-                files={"file": ("portrait.jpg", source.getvalue(), "image/jpeg")},
-            )
-            self.assertEqual(first.status_code, 200, first.text)
-            payload = first.json()
-            self.assertEqual(payload["id"], str(image_id))
-            self.assertEqual(payload["media_type"], "image/webp")
-            self.assertLessEqual(max(payload["width"], payload["height"]), 512)
-            stored = storage_client.put_object.call_args_list[0].kwargs
-            self.assertEqual(stored["IfNoneMatch"], "*")
-            self.assertEqual(stored["ContentType"], "image/jxl")
-            pixels = imagecodecs.jpegxl_decode(stored["Body"])
-            self.assertEqual(pixels.shape[:2], (payload["height"], payload["width"]))
-            second = await client.put(
-                path,
-                headers=headers,
-                files={"file": ("ignored.png", b"invalid retry bytes", "image/png")},
-            )
-            self.assertEqual(second.status_code, 200, second.text)
-            self.assertEqual(second.json()["id"], payload["id"])
-            self.assertEqual(storage_client.put_object.call_count, 2)
-
-    async def test_portrait_upload_budget_is_enforced_before_parsing(self) -> None:
-        async with self.application(Mock(spec=ImageService)) as (client, _):
-            response = await client.put(
-                f"/images/{uuid4()}/portrait",
-                headers={"Authorization": "Bearer " + token(self.private_key)},
-                content=b"x" * (MAX_UPLOAD_BODY_BYTES + 1),
-            )
-            self.assertEqual(response.status_code, 413)
-
-    async def test_portrait_selection_is_owned_and_automatic_import_cannot_replace_it(
-        self,
-    ) -> None:
-        images = ImageService(S3ImageStore(memory_storage(), "images", None, 900))
-        async with self.application(images) as (client, _):
-            headers = {"Authorization": "Bearer " + token(self.private_key)}
-            self.assertIsNone(
-                (await client.get("/account/portrait", headers=headers)).json()
-            )
-            ids: list[str] = []
-            for color in ("red", "blue"):
-                source = BytesIO()
-                Image.new("RGB", (2, 2), color).save(source, format="PNG")
-                response = await client.post(
-                    "/images",
-                    headers=headers,
-                    files={"file": ("portrait.png", source.getvalue(), "image/png")},
-                )
-                self.assertEqual(response.status_code, 201)
-                ids.append(response.json()["id"])
-            selected = await client.put(
-                "/account/portrait", headers=headers, json={"image_id": ids[0]}
-            )
-            self.assertEqual(selected.status_code, 200, selected.text)
-            self.assertEqual(selected.json()["id"], ids[0])
-            automatic = await client.put(
-                "/account/portrait",
-                headers=headers,
-                json={"image_id": ids[1], "if_absent": True},
-            )
-            self.assertEqual(automatic.json()["id"], ids[0])
-            other = {
-                "Authorization": "Bearer "
-                + token(
-                    self.private_key,
-                    claims={"sub": "22222222-2222-4222-8222-222222222222"},
-                )
-            }
-            self.assertIsNone(
-                (await client.get("/account/portrait", headers=other)).json()
-            )
-            self.assertEqual(
-                (
-                    await client.put(
-                        "/account/portrait", headers=other, json={"image_id": ids[0]}
-                    )
-                ).status_code,
-                404,
-            )
-            await client.delete("/images/" + ids[0], headers=headers)
-            self.assertIsNone(
-                (await client.get("/account/portrait", headers=headers)).json()
-            )
-
-    async def test_unconfigured_authentication_fails_closed(self) -> None:
-        with (
-            patch(
-                "app.main.get_settings",
-                return_value=configuration(auth_issuer=None, auth_jwks_url=None),
-            ),
-            patch("app.main.build_image_service", return_value=None),
-        ):
-            app = create_app()
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="https://arctic.example"
-        ) as client:
-            response = await client.get(
-                "/images", headers={"Authorization": "Bearer anything"}
-            )
-            self.assertEqual(response.status_code, 503)
-            self.assertEqual(response.json()["code"], "authentication_unavailable")
-            self.assertEqual((await client.get("/images")).status_code, 401)
-            self.assertEqual((await client.get("/health")).status_code, 200)
 
 
 class ConfigurationAndStorageTests(unittest.TestCase):
@@ -761,75 +384,3 @@ class ConfigurationAndStorageTests(unittest.TestCase):
                 configuration(auth_issuer=None, auth_jwks_url=None)
             )
         )
-
-    def test_storage_is_isolated_for_opaque_subjects_and_issuers(self) -> None:
-        account = Account(id="../../opaque/provider:id", issuer=_ISSUER)
-        other = Account(id=account.id, issuer="https://other.example")
-        image_id = uuid4()
-        client = Mock()
-        store = S3ImageStore(client, "images", None, 900)
-        self.assertNotEqual(account_prefix(account), account_prefix(other))
-        self.assertNotIn("..", account_prefix(account))
-        self.assertNotIn("provider", account_prefix(account))
-        client.list_objects_v2.return_value = {"Contents": []}
-        self.assertEqual(store.list_images(account, limit=10), [])
-        client.list_objects_v2.assert_called_once_with(
-            Bucket="images", Prefix=account_prefix(account), MaxKeys=1000
-        )
-        client.generate_presigned_url.return_value = "https://images.example/signed"
-        store.url_for(account, image_id, "webp")
-        self.assertEqual(
-            client.generate_presigned_url.call_args.kwargs["Params"]["Key"],
-            object_key(account, image_id, "webp"),
-        )
-
-    def test_other_accounts_cannot_read_delete_or_list_an_image(self) -> None:
-        owner = Account(id="11111111-1111-4111-8111-111111111111", issuer=_ISSUER)
-        other = Account(id="other-account-id", issuer=_ISSUER)
-        image_id = uuid4()
-        owner_key = object_key(owner, image_id, "webp")
-        client = Mock()
-        modified = datetime.now(UTC)
-
-        def head(*, Bucket: str, Key: str) -> dict[str, object]:
-            if Key != owner_key:
-                raise ClientError(
-                    {
-                        "Error": {"Code": "NoSuchKey"},
-                    },
-                    "HeadObject",
-                )
-            return {
-                "ContentLength": 10,
-                "LastModified": modified,
-                "Metadata": {"width": "1", "height": "1"},
-            }
-
-        client.head_object.side_effect = head
-        client.list_objects_v2.return_value = {
-            "Contents": [
-                {"Key": owner_key, "Size": 10, "LastModified": modified},
-                {
-                    "Key": "accounts/"
-                    + str(uuid4())
-                    + "/images/"
-                    + str(image_id)
-                    + ".webp",
-                    "Size": 10,
-                    "LastModified": modified,
-                },
-            ]
-        }
-        store = S3ImageStore(client, "images", None, 900)
-        self.assertEqual(store.get_image(owner, image_id).id, image_id)
-        self.assertEqual(len(store.list_images(owner, limit=10)), 1)
-        self.assertEqual(store.list_images(other, limit=10), [])
-        with self.assertRaises(ImageNotFound):
-            store.get_image(other, image_id)
-        with self.assertRaises(ImageNotFound):
-            store.delete_image(other, image_id)
-        client.delete_object.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()

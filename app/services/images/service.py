@@ -1,334 +1,353 @@
-"""Store general-purpose images for an account."""
+"""Direct AVIF uploads, catalog quotas, and authorized byte delivery."""
 
-import logging
-from dataclasses import replace
-from datetime import UTC, datetime
-from typing import BinaryIO
-from uuid import UUID, uuid4
+from datetime import UTC, datetime, timedelta
+from typing import Literal
+from uuid import UUID
 
-import imagecodecs
-from pydantic import AnyHttpUrl, TypeAdapter, ValidationError
+from pydantic import UUID7, AwareDatetime
 
-from app.accounts import Account
-from app.schemas import ImageListResponse, ImageResponse, ImageSummary
-from app.services.images.content import content_id, source_digest
-from app.services.images.errors import (
-    ImageEmpty,
-    ImageNotFound,
-    ImageQuotaExceeded,
-    ImageServiceError,
-    ImageTooLarge,
-    StorageInvalid,
+from app.schemas import ImageResponse, ImageUploadResponse, IssueImage
+from app.services.database import Database, Session
+from app.services.errors import Conflict, NotFound, ServiceError
+from app.services.identifiers import image_key
+from app.services.limits import MAX_IMAGE_BYTES, UPLOAD_TIMEOUT_SECONDS
+from app.services.models import Account, Image, Record
+from app.services.storage.objects import (
+    ImageBody,
+    ImageObjects,
+    ObjectMissing,
     StorageUnavailable,
 )
-from app.services.images.limits import MAX_LISTED_IMAGES, TEMPORARY_ACCOUNT_IMAGE_CAP
-from app.services.images.models import (
-    DeliveryFormat,
-    ImageExtension,
-    ImageObject,
-    ProcessedImage,
-)
-from app.services.images.processing import (
-    ImagePipeline,
-    delivery_variant,
-    process_image,
-)
-from app.services.images.storage import ImageStore, build_image_store
-from app.settings import Settings
-
-logger = logging.getLogger(__name__)
-
-_URL = TypeAdapter(AnyHttpUrl)
+from app.services.storage.signing import S3Signer
+from app.services.time import database_time
 
 
-class ImageService:
-    """Compress uploads and keep them in object storage."""
-
-    def __init__(
-        self, store: ImageStore, pipeline: ImagePipeline | None = None
-    ) -> None:
-        # Load the native codec at startup so deployment health checks catch
-        # incompatible/missing wheels before publishing any delivery URLs.
-        if not imagecodecs.JPEGXL.available:
-            raise RuntimeError("JPEG XL codec is unavailable")
-        self._store = store
-        self._pipeline = replace(pipeline or ImagePipeline(), output_format="jxl")
-
-    def close(self) -> None:
-        """Release the storage client."""
-        self._store.close()
-
-    def open(self) -> None:
-        """Verify object storage access."""
-        self._store.open()
-
-    def portrait(
-        self, account: Account, *, format: DeliveryFormat = "webp"
-    ) -> ImageResponse | None:
-        image_id = self._store.portrait_id(account)
-        if image_id is None:
-            return None
-        try:
-            return self.get_image(account, image_id, format=format)
-        except ImageNotFound:
-            return None
-
-    def select_portrait(
-        self, account: Account, image_id: UUID, *, if_absent: bool = False
-    ) -> ImageResponse | None:
-        self._store.select_portrait(account, image_id, if_absent=if_absent)
-        return self.portrait(account)
-
-    def create(
-        self,
-        account: Account,
-        source: BinaryIO,
-        known_size: int | None,
-        *,
-        image_id: UUID | None = None,
-        portrait: bool = False,
-        format: DeliveryFormat | None = None,
-    ) -> ImageResponse:
-        """Recompress an upload and store it under the account."""
-        # Caller-selected IDs make migration retries idempotent. IDs remain
-        # scoped to the verified account and existing objects are immutable.
-        if image_id is not None:
-            try:
-                return self.get_image(
-                    account, image_id, format=format or ("webp" if portrait else "jxl")
-                )
-            except ImageNotFound:
-                pass
-        payload = _read_limited(source, known_size, self._pipeline.max_upload_bytes)
-        digest = None
-        if image_id is None and not portrait:
-            digest = source_digest(payload)
-            image_id = content_id(account, digest)
-            try:
-                return self.get_by_source(account, digest, format=format or "jxl")
-            except ImageNotFound:
-                pass
-        image_id = image_id or uuid4()
-        limit = TEMPORARY_ACCOUNT_IMAGE_CAP
-        if self._store.count_images(account, maximum=limit + 1) >= limit:
-            # Another device may have completed the same upload after our first
-            # lookup. Reuse it even when its write filled the account quota.
-            if digest is not None:
-                try:
-                    return self.get_by_source(account, digest, format=format or "jxl")
-                except ImageNotFound:
-                    pass
-            raise ImageQuotaExceeded(limit)
-        pipeline = (
-            replace(
-                self._pipeline,
-                max_output_edge=min(512, self._pipeline.max_output_edge or 512),
-            )
-            if portrait
-            else self._pipeline
-        )
-        processed = process_image(payload, pipeline)
-        created_at = datetime.now(UTC)
-        if not self._store.put_image(
-            account,
-            image_id,
-            processed,
-            if_absent=True,
-            source_sha256=digest,
-            created_at=created_at,
-        ):
-            if digest is not None:
-                return self.get_by_source(account, digest, format=format or "jxl")
-            return self.get_image(
-                account, image_id, format=format or ("webp" if portrait else "jxl")
-            )
-        self._enforce_cap(account, image_id, processed.extension, limit)
-        canonical = ImageObject(
-            id=image_id,
-            media_type=processed.media_type,
-            extension=processed.extension,
-            channels=processed.channels,
-            byte_size=len(processed.data),
-            width=processed.width,
-            height=processed.height,
-            created_at=created_at,
-            source_sha256=digest,
-        )
-        delivered = self._delivery(
-            account,
-            canonical,
-            format or ("webp" if portrait else "jxl"),
-            processed.data,
-        )
-        return self._response(account, delivered)
-
-    def get_by_source(
-        self, account: Account, digest: str, *, format: DeliveryFormat = "jxl"
-    ) -> ImageResponse:
-        """Resolve verified source bytes without uploading or recompressing them.
-
-        A client-provided digest can only look up an object. Only create(), which
-        hashes the actual bounded upload, can populate this cache. Deletion of
-        the canonical object also removes its cache entry without a second index.
-        """
-        image = self._store.get_representation(
-            account, content_id(account, digest), "jxl"
-        )
-        if image.source_sha256 != digest:
-            raise StorageInvalid()
-        return self._response(account, self._delivery(account, image, format))
-
-    def list_images(self, account: Account) -> ImageListResponse:
-        """List the account's stored images, oldest first."""
-        images = [
-            _summary(account, image, self._store)
-            for image in self._store.list_images(account, limit=MAX_LISTED_IMAGES)
-        ]
-        return ImageListResponse(images=images)
-
-    def get_image(
-        self, account: Account, image_id: UUID, *, format: DeliveryFormat = "webp"
-    ) -> ImageResponse:
-        """Return one stored image, including its pixel dimensions."""
-        image = self._store.get_image(account, image_id)
-        if image.extension != "jxl":
-            # Preserve IDs and existing immutable URLs. Legacy objects remain
-            # compatibility copies; all new variants derive from this source.
-            payload = self._store.read_image(account, image)
-            canonical = process_image(payload, replace(self._pipeline, lossless=True))
-            self._store.put_image(
-                account,
-                image_id,
-                canonical,
-                if_absent=True,
-                created_at=image.created_at,
-            )
-            image = self._store.get_representation(account, image_id, "jxl")
-        return self._response(account, self._delivery(account, image, format))
-
-    def _delivery(
-        self,
-        account: Account,
-        canonical: ImageObject,
-        format: DeliveryFormat,
-        payload: bytes | None = None,
-    ) -> ImageObject:
-        if format == "jxl":
-            return canonical
-        try:
-            return replace(
-                self._store.get_representation(
-                    account, canonical.id, format, variant=True
-                ),
-                created_at=canonical.created_at,
-            )
-        except ImageNotFound:
-            pass
-        variant: ProcessedImage = delivery_variant(
-            payload
-            if payload is not None
-            else self._store.read_image(account, canonical),
-            canonical,
-            format,
-        )
-        if not self._store.put_image(
-            account,
-            canonical.id,
-            variant,
-            if_absent=True,
-            variant=True,
-            created_at=canonical.created_at,
-        ):
-            return self._store.get_representation(
-                account, canonical.id, format, variant=True
-            )
-        return ImageObject(
-            id=canonical.id,
-            media_type=variant.media_type,
-            extension=variant.extension,
-            byte_size=len(variant.data),
-            width=variant.width,
-            height=variant.height,
-            created_at=canonical.created_at,
-            variant=True,
-        )
-
-    def _response(self, account: Account, image: ImageObject) -> ImageResponse:
-        if image.width is None or image.height is None:
-            raise StorageInvalid()
-        summary = _summary(account, image, self._store)
-        return ImageResponse(
-            id=summary.id,
-            media_type=summary.media_type,
-            byte_size=summary.byte_size,
-            width=image.width,
-            height=image.height,
-            url=summary.url,
-            url_expires_in=summary.url_expires_in,
-            created_at=summary.created_at,
-        )
-
-    def delete_image(self, account: Account, image_id: UUID) -> None:
-        """Delete one stored image belonging to the account."""
-        self._store.delete_image(account, image_id)
-
-    def _enforce_cap(
-        self,
-        account: Account,
-        image_id: UUID,
-        extension: ImageExtension,
-        limit: int,
-    ) -> None:
-        stored = self._store.list_images(account, limit=MAX_LISTED_IMAGES)
-        if len(stored) <= limit:
-            return
-        keep = {image.id for image in stored[:limit]}
-        if image_id in keep:
-            return
-        try:
-            self._store.discard_image(account, image_id, extension)
-        except ImageServiceError:
-            logger.warning("failed to remove an image stored above the account cap")
-            raise
-        raise ImageQuotaExceeded(limit)
+class ImageUpload(Record):
+    id: UUID7
+    account: UUID7
+    key: str
+    size: int
+    hash: str
+    state: Literal["issued", "confirmed", "pending", "deleted"]
+    issued_at: AwareDatetime
+    expires_at: AwareDatetime
 
 
-def build_image_service(settings: Settings) -> ImageService | None:
-    """Build the image service when object storage is configured."""
-    store = build_image_store(settings)
-    if store is None:
-        return None
-    return ImageService(store)
-
-
-def _read_limited(source: BinaryIO, known_size: int | None, limit: int) -> bytes:
-    if known_size is not None and known_size > limit:
-        raise ImageTooLarge()
-    source.seek(0)
-    payload = source.read(limit + 1)
-    if len(payload) > limit:
-        raise ImageTooLarge()
-    if not payload:
-        raise ImageEmpty()
-    return payload
-
-
-def _summary(account: Account, image: ImageObject, store: ImageStore) -> ImageSummary:
-    return ImageSummary(
+def image_response(image: Image) -> ImageResponse:
+    return ImageResponse(
         id=image.id,
-        media_type=image.media_type,
-        byte_size=image.byte_size,
-        url=_http_url(
-            store.url_for(account, image.id, image.extension, variant=image.variant)
-        ),
-        url_expires_in=store.url_expires_in,
+        account=image.account,
+        size=image.size,
+        hash=image.hash,
         created_at=image.created_at,
+        url=f"/images/{image.id}/content",
     )
 
 
-def _http_url(value: str) -> AnyHttpUrl:
-    try:
-        return _URL.validate_python(value)
-    except ValidationError:
-        logger.warning("object storage produced an unusable image URL")
-        raise StorageUnavailable() from None
+def is_avif(prefix: bytes) -> bool:
+    """Inspect only the ISO BMFF file-type box; never decode or transcode pixels."""
+    if len(prefix) < 16 or prefix[4:8] != b"ftyp":
+        return False
+    length = int.from_bytes(prefix[:4], "big")
+    if length < 16 or length > len(prefix) or length % 4:
+        return False
+    brands = [
+        prefix[8:12],
+        *[prefix[index : index + 4] for index in range(16, length, 4)],
+    ]
+    return b"avif" in brands or b"avis" in brands
+
+
+class ImageService:
+    def __init__(
+        self,
+        database: Database,
+        objects: ImageObjects,
+        signer: S3Signer,
+        *,
+        presign_seconds: int = 300,
+        daily_quota: int = 100,
+        total_quota: int = 300,
+    ) -> None:
+        self._database = database
+        self._objects = objects
+        self._signer = signer
+        self._seconds = presign_seconds
+        self._daily = daily_quota
+        self._total = total_quota
+
+    def _slot(self, upload: ImageUpload, now: datetime) -> ImageUploadResponse:
+        seconds = min(self._seconds, int((upload.expires_at - now).total_seconds()))
+        permission = (
+            self._signer.permission(
+                upload.key,
+                seconds,
+                method="PUT",
+                size=upload.size,
+                sha256=upload.hash,
+                media_type="image/avif",
+                now=now,
+            )
+            if upload.state == "issued" and seconds > 0
+            else None
+        )
+        return ImageUploadResponse(
+            id=upload.id, key=upload.key, upload=permission, image=None
+        )
+
+    def issue(self, account: Account, command: IssueImage) -> ImageUploadResponse:
+        with self._database.transaction() as session:
+            session.execute(
+                "select id from public.accounts where id=%s for update", (account.id,)
+            )
+            now = database_time(session)
+            existing = session.execute(
+                "select * from public.images where id=%s and account=%s and deleted_at is null",
+                (command.id, account.id),
+            )
+            if existing:
+                image = Image.model_validate(existing[0])
+                if image.hash != command.hash or image.size != command.size:
+                    raise Conflict("image_id_reused")
+                return ImageUploadResponse(
+                    id=image.id, key=image.key, upload=None, image=image_response(image)
+                )
+            if session.execute(
+                "select id from public.images where id=%s", (command.id,)
+            ):
+                raise Conflict("image_id_reused")
+            reservations = session.execute(
+                "select * from coordination.uploads where id=%s", (command.id,)
+            )
+            if reservations:
+                upload = ImageUpload.model_validate(reservations[0])
+                if upload.account != account.id:
+                    raise NotFound()
+                if (
+                    upload.hash != command.hash
+                    or upload.size != command.size
+                    or upload.state != "issued"
+                ):
+                    raise Conflict("image_id_reused")
+                return self._slot(upload, now)
+            duplicates = session.execute(
+                "select * from public.images where account=%s and hash=%s and deleted_at is null order by id limit 1",
+                (account.id, command.hash),
+            )
+            if duplicates:
+                image = Image.model_validate(duplicates[0])
+                return ImageUploadResponse(
+                    id=image.id, key=image.key, upload=None, image=image_response(image)
+                )
+            counts = session.execute(
+                """select
+                    (select count(*) from coordination.uploads where account=%s and issued_at >= %s) as daily,
+                    ((select count(*) from public.images where account=%s and deleted_at is null) +
+                     (select count(*) from coordination.uploads where account=%s and state='issued')) as total""",
+                (
+                    account.id,
+                    now.astimezone(UTC).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    ),
+                    account.id,
+                    account.id,
+                ),
+            )[0]
+            if (
+                int(str(counts["daily"])) >= self._daily
+                or int(str(counts["total"])) >= self._total
+            ):
+                raise ServiceError(
+                    "image_quota_exceeded",
+                    "The daily or stored image quota has been reached.",
+                    429,
+                )
+            rows = session.execute(
+                """insert into coordination.uploads(id,account,key,size,hash,issued_at,expires_at)
+                    values(%s,%s,%s,%s,%s,%s,%s) returning *""",
+                (
+                    command.id,
+                    account.id,
+                    image_key(account.id, command.id),
+                    command.size,
+                    command.hash,
+                    now,
+                    now + timedelta(seconds=self._seconds),
+                ),
+            )
+            return self._slot(ImageUpload.model_validate(rows[0]), now)
+
+    def confirm(self, account: Account, image_id: UUID) -> ImageResponse:
+        invalid: ImageUpload | None = None
+        with self._database.transaction() as session:
+            session.execute(
+                "select id from public.accounts where id=%s for update", (account.id,)
+            )
+            rows = session.execute(
+                "select * from public.images where id=%s and account=%s and deleted_at is null",
+                (image_id, account.id),
+            )
+            if rows:
+                return image_response(Image.model_validate(rows[0]))
+            rows = session.execute(
+                "select * from coordination.uploads where id=%s and account=%s for update",
+                (image_id, account.id),
+            )
+            if not rows:
+                raise NotFound()
+            upload = ImageUpload.model_validate(rows[0])
+            now = database_time(session)
+            if upload.state != "issued" or now >= upload.issued_at + timedelta(
+                seconds=UPLOAD_TIMEOUT_SECONDS
+            ):
+                raise ServiceError(
+                    "image_upload_expired", "Request a new image upload slot.", 410
+                )
+            metadata = self._objects.head(upload.key)
+            if (
+                metadata.size != upload.size
+                or not 0 < metadata.size <= MAX_IMAGE_BYTES
+                or metadata.media_type != "image/avif"
+                or metadata.metadata.get("sha256") != upload.hash
+                or not is_avif(self._objects.prefix(upload.key, 512))
+            ):
+                session.execute(
+                    "update coordination.uploads set state='pending' where id=%s",
+                    (image_id,),
+                )
+                invalid = upload
+            else:
+                rows = session.execute(
+                    """insert into public.images(id,account,key,size,hash,created_at) values(%s,%s,%s,%s,%s,%s) returning *""",
+                    (upload.id, account.id, upload.key, upload.size, upload.hash, now),
+                )
+                session.execute(
+                    "update coordination.uploads set state='confirmed' where id=%s",
+                    (image_id,),
+                )
+                return image_response(Image.model_validate(rows[0]))
+        assert invalid is not None
+        self.discard(invalid.id, invalid.key)
+        raise ServiceError(
+            "invalid_avif",
+            "Upload an AVIF matching the authorized size and SHA-256.",
+            415,
+        )
+
+    def discard(self, image_id: UUID, key: str) -> bool:
+        try:
+            self._objects.delete(key)
+        except StorageUnavailable:
+            return False
+        with self._database.transaction() as session:
+            session.execute(
+                "update coordination.uploads set state='deleted' where id=%s and state='pending'",
+                (image_id,),
+            )
+        return True
+
+    def list_images(
+        self, account: Account, *, limit: int, offset: int
+    ) -> list[ImageResponse]:
+        with self._database.transaction() as session:
+            return [
+                image_response(Image.model_validate(row))
+                for row in session.execute(
+                    "select * from public.images where account=%s and deleted_at is null order by created_at desc,id limit %s offset %s",
+                    (account.id, limit, offset),
+                )
+            ]
+
+    def by_hash(self, account: Account, digest: str) -> ImageResponse:
+        with self._database.transaction() as session:
+            rows = session.execute(
+                "select * from public.images where account=%s and hash=%s and deleted_at is null order by id limit 1",
+                (account.id, digest),
+            )
+            if not rows:
+                raise NotFound()
+            return image_response(Image.model_validate(rows[0]))
+
+    def _readable(self, session: Session, account: Account, image_id: UUID) -> Image:
+        rows = session.execute(
+            """select i.* from public.images i where i.id=%s and i.deleted_at is null
+                and (i.account=%s or exists(select 1 from documents.images r
+                    join documents.grants g on g.document_id=r.document_id
+                    join documents.documents d on d.id=r.document_id
+                    where r.image_id=i.id and g.account_id=%s and d.trashed_at is null))""",
+            (image_id, account.id, account.id),
+        )
+        if not rows:
+            raise NotFound()
+        return Image.model_validate(rows[0])
+
+    def metadata(self, account: Account, image_id: UUID) -> ImageResponse:
+        with self._database.transaction() as session:
+            return image_response(self._readable(session, account, image_id))
+
+    def content(self, account: Account, image_id: UUID) -> tuple[Image, ImageBody]:
+        with self._database.transaction() as session:
+            image = self._readable(session, account, image_id)
+        return image, self._stream(image)
+
+    def avatar(self, account_id: UUID) -> tuple[Image, ImageBody]:
+        with self._database.transaction() as session:
+            rows = session.execute(
+                """select i.* from public.accounts a join public.images i on i.id=a.avatar_id
+                where a.id=%s and i.deleted_at is null""",
+                (account_id,),
+            )
+            if not rows:
+                raise NotFound()
+            image = Image.model_validate(rows[0])
+        return image, self._stream(image)
+
+    def _stream(self, image: Image) -> ImageBody:
+        try:
+            body = self._objects.stream(image.key)
+        except ObjectMissing:
+            raise NotFound() from None
+        if body.size != image.size:
+            body.close()
+            raise StorageUnavailable()
+        return body
+
+    def delete(self, account: Account, image_id: UUID) -> None:
+        with self._database.transaction() as session:
+            session.execute(
+                "select id from public.accounts where id=%s for update", (account.id,)
+            )
+            rows = session.execute(
+                "select * from public.images where id=%s and account=%s for update",
+                (image_id, account.id),
+            )
+            if not rows:
+                raise NotFound()
+            image = Image.model_validate(rows[0])
+            if session.execute(
+                """select image_id from documents.images where image_id=%s
+                union all select avatar_id from public.accounts where avatar_id=%s limit 1""",
+                (image_id, image_id),
+            ):
+                raise ServiceError(
+                    "image_referenced",
+                    "Images referenced by document history or a profile cannot be deleted.",
+                )
+            session.execute(
+                "update public.images set deleted_at=coalesce(deleted_at,clock_timestamp()) where id=%s",
+                (image_id,),
+            )
+            session.execute(
+                """insert into coordination.uploads(id,account,key,size,hash,state,issued_at,expires_at)
+                values(%s,%s,%s,%s,%s,'pending',%s,clock_timestamp())
+                on conflict(id) do update set state='pending'""",
+                (
+                    image.id,
+                    image.account,
+                    image.key,
+                    image.size,
+                    image.hash,
+                    image.created_at,
+                ),
+            )
+        self.discard(image.id, image.key)

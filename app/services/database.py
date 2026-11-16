@@ -10,10 +10,11 @@ if TYPE_CHECKING:
     from psycopg import Connection
     from psycopg_pool import ConnectionPool
 
-from app.services.documents.errors import Conflict, Unavailable
-from app.services.documents.values import JsonParameter
+from app.services.errors import Conflict, Unavailable
 
 type Row = dict[str, object]
+
+TRANSACTION_SETTINGS = "set local statement_timeout='15s'; set local lock_timeout='5s'"
 
 
 class Session(Protocol):
@@ -21,6 +22,8 @@ class Session(Protocol):
 
 
 class Database(Protocol):
+    """Transactions use READ COMMITTED so permission reads follow acquired locks."""
+
     def transaction(self) -> AbstractContextManager[Session]: ...
     def open(self) -> None: ...
     def close(self) -> None: ...
@@ -32,12 +35,7 @@ class PostgresSession:
 
     def execute(self, query: str, parameters: Sequence[object] = ()) -> list[Row]:
         from psycopg.rows import dict_row
-        from psycopg.types.json import Jsonb
 
-        parameters = [
-            Jsonb(value.obj) if isinstance(value, JsonParameter) else value
-            for value in parameters
-        ]
         with self._connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(query, parameters or None)
             if cursor.description is None:
@@ -61,7 +59,7 @@ class PostgresDatabase:
             },
             timeout=10,
             max_waiting=32,
-            name="documents",
+            name="catalog",
         )
 
     def open(self) -> None:
@@ -79,8 +77,8 @@ class PostgresDatabase:
         try:
             with self._pool.connection() as connection, connection.transaction():
                 session = PostgresSession(connection)
-                session.execute("set local statement_timeout='15s'")
-                session.execute("set local lock_timeout='5s'")
+                session.execute("set transaction isolation level read committed")
+                session.execute(TRANSACTION_SETTINGS)
                 yield session
         except PoolTimeout, TooManyRequests, OperationalError:
             raise Unavailable() from None
@@ -103,14 +101,45 @@ def verify_runtime(database: Database) -> None:
 
 
 def verify_session(session: Session) -> None:
+    verify_role(session)
+    verify_catalog(session)
+
+
+def verify_role(session: Session) -> None:
     rows = session.execute("""select r.rolsuper, r.rolbypassrls,
             exists(select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
-              where n.nspname='documents' and c.relowner=r.oid) as owns_storage
+              where (n.nspname in ('documents','coordination')
+                or (n.nspname='public' and c.relname in ('accounts','images')))
+                and c.relowner=r.oid) as owns_storage
             from pg_roles r where r.rolname=current_user""")
     if not rows or any(rows[0].values()):
         raise Unavailable()
-    flags = session.execute("""select c.relrowsecurity from pg_class c join pg_namespace n
-            on n.oid=c.relnamespace where n.nspname='documents' and c.relkind='r'""")
-    if len(flags) != 7 or any(row["relrowsecurity"] for row in flags):
+
+
+def verify_catalog(session: Session) -> None:
+    """Check the same catalog shape with either an admin or a runtime login."""
+    flags = session.execute("""select n.nspname,c.relname,c.relrowsecurity
+            from pg_class c join pg_namespace n on n.oid=c.relnamespace
+            where (n.nspname in ('documents','coordination')
+              or (n.nspname='public' and c.relname in ('accounts','images')))
+              and c.relkind='r'""")
+    expected = {
+        ("documents", "spaces"),
+        ("documents", "documents"),
+        ("documents", "checkpoints"),
+        ("documents", "grants"),
+        ("documents", "images"),
+        ("public", "accounts"),
+        ("public", "images"),
+        ("coordination", "batches"),
+        ("coordination", "items"),
+        ("coordination", "attempts"),
+        ("coordination", "images"),
+        ("coordination", "uploads"),
+    }
+    if {(row["nspname"], row["relname"]) for row in flags} != expected or any(
+        row["relrowsecurity"] for row in flags
+    ):
         raise Unavailable()
-    session.execute("select id from documents.documents limit 0")
+    session.execute("select id,revision,key from documents.documents limit 0")
+    session.execute("select id,avatar_id,last_sync from public.accounts limit 0")

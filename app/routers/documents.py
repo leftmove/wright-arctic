@@ -1,59 +1,26 @@
-"""Documents API. Authentication runs before body buffering; handlers stay thin."""
+"""Document metadata, permissions, and trash lifecycle."""
 
 from typing import Annotated
-from uuid import UUID
 
-from fastapi import APIRouter, FastAPI, File, Form, Query, Request, Response, UploadFile
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ValidationError
+from fastapi import APIRouter, Query, Request, Response
+from pydantic import UUID7
 
 from app.dependencies import AccountDep, execute, require_document_service
 from app.schemas import (
-    AppendDocuments,
     CreateDocument,
-    DocumentChange,
-    DocumentCommand,
-    DocumentContent,
     DocumentGrant,
-    DocumentReceipt,
     DocumentSummary,
     GrantDocument,
     RenameDocument,
-    RestoreDocument,
-    ShareDocument,
-    UploadDocument,
-    error_body,
 )
-from app.services.documents.errors import DocumentError, InvalidNative, TooLarge
-from app.services.documents.native import MAX_STATE, MAX_UPDATE
 
-router = APIRouter(prefix="/documents", tags=["documents"])
-
-
-def _metadata[T: BaseModel](model: type[T], raw: str) -> T:
-    try:
-        return model.model_validate_json(raw)
-    except ValidationError:
-        raise DocumentError(
-            "invalid_document_metadata", "Document metadata is invalid.", 422
-        ) from None
-
-
-def _binary(file: UploadFile, maximum: int) -> bytes:
-    if file.size is not None and file.size > maximum:
-        raise TooLarge()
-    data = file.file.read(maximum + 1)
-    if len(data) > maximum:
-        raise TooLarge()
-    if not data:
-        raise InvalidNative()
-    return data
+router = APIRouter(prefix="/documents", tags=["metadata"])
 
 
 @router.post("", status_code=201)
 async def create_document(
     command: CreateDocument, account: AccountDep, request: Request
-) -> DocumentReceipt:
+) -> DocumentSummary:
     return await execute(
         request, require_document_service(request).create, account, command
     )
@@ -77,249 +44,92 @@ async def list_documents(
     )
 
 
-@router.get("/resolve/{namespace}/{slug}")
-async def resolve_document(
-    namespace: str, slug: str, account: AccountDep, request: Request
-) -> DocumentSummary:
-    return await execute(
-        request, require_document_service(request).resolve, account, namespace, slug
-    )
-
-
-@router.put("/{document_id}")
-async def upload_document(
-    document_id: UUID,
-    account: AccountDep,
-    request: Request,
-    metadata: Annotated[str, Form(max_length=8192)],
-    state: Annotated[UploadFile, File()],
-) -> DocumentReceipt:
-    command = _metadata(UploadDocument, metadata)
-    return await execute(
-        request,
-        require_document_service(request).upload,
-        account,
-        document_id,
-        command,
-        _binary(state, MAX_STATE),
-    )
-
-
 @router.get("/{document_id}")
 async def document_metadata(
-    document_id: UUID, account: AccountDep, request: Request
+    document_id: UUID7, account: AccountDep, request: Request
 ) -> DocumentSummary:
     return await execute(
         request, require_document_service(request).metadata, account, document_id
     )
 
 
-@router.get("/{document_id}/state", response_class=Response)
-async def document_state(
-    document_id: UUID,
-    account: AccountDep,
-    request: Request,
-    through_seq: Annotated[int | None, Query(ge=0)] = None,
-) -> Response:
-    prefix, prepared = await execute(
-        request,
-        require_document_service(request).state,
-        account,
-        document_id,
-        through_seq,
-    )
-    return Response(
-        prepared.state,
-        media_type="application/octet-stream",
-        headers={
-            "X-Document-Id": str(document_id),
-            "X-Document-Head": str(prefix.through_seq),
-            "X-Document-Format": str(prefix.document.format_version),
-            "X-Document-Schema": prefix.document.schema_name,
-            "X-Document-Schema-Version": str(prefix.document.schema_version),
-        },
-    )
-
-
-@router.get("/{document_id}/content")
-async def document_content(
-    document_id: UUID, account: AccountDep, request: Request
-) -> DocumentContent:
-    return await execute(
-        request, require_document_service(request).content, account, document_id
-    )
-
-
-@router.post("/{document_id}/changes")
-async def append_changes(
-    document_id: UUID,
-    account: AccountDep,
-    request: Request,
-    metadata: Annotated[str, Form(max_length=16384)],
-    updates: Annotated[list[UploadFile], File()],
-) -> list[DocumentReceipt]:
-    command = _metadata(AppendDocuments, metadata)
-    return await execute(
-        request,
-        require_document_service(request).append,
-        account,
-        document_id,
-        command.operations,
-        [_binary(file, MAX_UPDATE) for file in updates],
-    )
-
-
-@router.get("/{document_id}/changes")
-async def document_history(
-    document_id: UUID,
-    account: AccountDep,
-    request: Request,
-    after: Annotated[int, Query(ge=-1)] = -1,
-    limit: Annotated[int, Query(ge=1, le=512)] = 128,
-) -> list[DocumentChange]:
-    return await execute(
-        request,
-        require_document_service(request).history,
-        account,
-        document_id,
-        after,
-        limit,
-    )
-
-
-@router.get("/{document_id}/changes/{sequence}", response_class=Response)
-async def change_bytes(
-    document_id: UUID, sequence: int, account: AccountDep, request: Request
-) -> Response:
-    payload = await execute(
-        request,
-        require_document_service(request).change,
-        account,
-        document_id,
-        sequence,
-    )
-    return Response(
-        payload,
-        status_code=200 if payload is not None else 204,
-        media_type="application/octet-stream",
-    )
-
-
 @router.patch("/{document_id}/title")
 async def rename_document(
-    document_id: UUID, command: RenameDocument, account: AccountDep, request: Request
-) -> DocumentReceipt:
+    document_id: UUID7, command: RenameDocument, account: AccountDep, request: Request
+) -> DocumentSummary:
     return await execute(
-        request, require_document_service(request).rename, account, document_id, command
+        request,
+        require_document_service(request).rename,
+        account,
+        document_id,
+        command.title,
     )
 
 
-@router.post("/{document_id}/share")
-async def share_document(
-    document_id: UUID, command: ShareDocument, account: AccountDep, request: Request
-) -> DocumentReceipt:
-    return await execute(
-        request, require_document_service(request).share, account, document_id, command
-    )
-
-
-@router.get("/{document_id}/access")
+@router.get("/{document_id}/grants")
 async def document_grants(
-    document_id: UUID, account: AccountDep, request: Request
+    document_id: UUID7, account: AccountDep, request: Request
 ) -> list[DocumentGrant]:
     return await execute(
         request, require_document_service(request).grants, account, document_id
     )
 
 
-@router.put("/{document_id}/access/{user_id}")
+@router.put("/{document_id}/grants/{account_id}", status_code=204)
 async def grant_document(
-    document_id: UUID,
-    user_id: UUID,
+    document_id: UUID7,
+    account_id: UUID7,
     command: GrantDocument,
     account: AccountDep,
     request: Request,
-) -> DocumentReceipt:
-    return await execute(
+) -> Response:
+    await execute(
         request,
         require_document_service(request).grant,
         account,
         document_id,
-        command.operation_id,
-        user_id,
+        account_id,
         command.role,
     )
+    return Response(status_code=204)
+
+
+@router.delete("/{document_id}/grants/{account_id}", status_code=204)
+async def revoke_document(
+    document_id: UUID7, account_id: UUID7, account: AccountDep, request: Request
+) -> Response:
+    await execute(
+        request,
+        require_document_service(request).grant,
+        account,
+        document_id,
+        account_id,
+        None,
+    )
+    return Response(status_code=204)
 
 
 @router.post("/{document_id}/trash")
 async def trash_document(
-    document_id: UUID, command: DocumentCommand, account: AccountDep, request: Request
-) -> DocumentReceipt:
+    document_id: UUID7, account: AccountDep, request: Request
+) -> DocumentSummary:
     return await execute(
         request,
         require_document_service(request).lifecycle,
         account,
         document_id,
-        command.operation_id,
-        True,
+        trashed=True,
     )
 
 
 @router.post("/{document_id}/restore")
 async def restore_document(
-    document_id: UUID, command: DocumentCommand, account: AccountDep, request: Request
-) -> DocumentReceipt:
+    document_id: UUID7, account: AccountDep, request: Request
+) -> DocumentSummary:
     return await execute(
         request,
         require_document_service(request).lifecycle,
         account,
         document_id,
-        command.operation_id,
-        False,
-    )
-
-
-@router.post("/{document_id}/restore-content")
-async def restore_content(
-    document_id: UUID, command: RestoreDocument, account: AccountDep, request: Request
-) -> DocumentReceipt:
-    return await execute(
-        request,
-        require_document_service(request).restore,
-        account,
-        document_id,
-        command.operation_id,
-        command.through_seq,
-    )
-
-
-@router.post("/{document_id}/snapshots")
-async def checkpoint_document(
-    document_id: UUID,
-    account: AccountDep,
-    request: Request,
-    through_seq: Annotated[int | None, Query(ge=0)] = None,
-) -> dict[str, int]:
-    return {
-        "through_seq": await execute(
-            request,
-            require_document_service(request).snapshot,
-            account,
-            document_id,
-            through_seq,
-        )
-    }
-
-
-def install_document_error_handler(application: FastAPI) -> None:
-    application.add_exception_handler(DocumentError, _error)
-
-
-async def _error(_request: Request, error: Exception) -> JSONResponse:
-    if not isinstance(error, DocumentError):
-        raise error
-    return JSONResponse(
-        error_body(error.code, error.message),
-        status_code=error.status,
-        headers={"Cache-Control": "private, no-store", "Vary": "Authorization"},
+        trashed=False,
     )

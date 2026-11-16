@@ -1,81 +1,83 @@
-"""In-memory S3 behavior for image lifecycle tests, including conditional writes."""
+"""In-memory object transports; PostgreSQL policy remains production code."""
 
-from datetime import UTC, datetime
-from io import BytesIO
-from threading import Lock
-from unittest.mock import Mock
+from collections.abc import Iterator
+from threading import Barrier
 
-from botocore.exceptions import ClientError
+from app.schemas import ImageUploadResponse, UploadSlot
+from app.services.storage.objects import (
+    ImageBody,
+    ObjectMetadata,
+    ObjectMissing,
+    StorageUnavailable,
+)
 
 
-def memory_storage() -> Mock:
-    objects: dict[str, tuple[bytes, dict[str, str], str]] = {}
-    client = Mock()
-    modified = datetime.now(UTC)
-    writes = Lock()
+class Checkpoints:
+    def __init__(self) -> None:
+        self.objects: dict[str, ObjectMetadata] = {}
+        self.heads: list[str] = []
+        self.deleted: list[str] = []
+        self.fail_delete = False
+        self.barrier: Barrier | None = None
 
-    def missing() -> ClientError:
-        return ClientError({"Error": {"Code": "NoSuchKey"}}, "HeadObject")
+    def close(self) -> None:
+        pass
 
-    def put(
-        *,
-        Bucket: str,
-        Key: str,
-        Body: bytes,
-        Metadata: dict[str, str],
-        ContentType: str,
-        CacheControl: str,
-        ContentDisposition: str,
-        IfNoneMatch: str | None = None,
+    def head(self, key: str) -> ObjectMetadata:
+        self.heads.append(key)
+        if self.barrier is not None:
+            self.barrier.wait(timeout=10)
+        if key not in self.objects:
+            raise ObjectMissing()
+        return self.objects[key]
+
+    def upload(self, slot: UploadSlot) -> None:
+        assert slot.upload is not None
+        headers = slot.upload.headers
+        self.objects[slot.key] = ObjectMetadata(
+            int(headers["content-length"]),
+            headers["content-type"],
+            {"sha256": headers["x-amz-meta-sha256"]},
+        )
+
+    def delete(self, key: str) -> None:
+        if self.fail_delete:
+            raise StorageUnavailable()
+        self.objects.pop(key, None)
+        self.deleted.append(key)
+
+
+class Images(Checkpoints):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bytes: dict[str, bytes] = {}
+        self.prefixes: list[str] = []
+        self.reads: list[str] = []
+
+    def upload_image(
+        self, slot: ImageUploadResponse, data: bytes, *, media_type: str = "image/avif"
     ) -> None:
-        with writes:
-            if IfNoneMatch == "*" and Key in objects:
-                raise ClientError(
-                    {
-                        "ResponseMetadata": {
-                            "HTTPStatusCode": 412,
-                            "HTTPHeaders": {},
-                            "HostId": "test",
-                            "RequestId": "test",
-                            "RetryAttempts": 0,
-                        }
-                    },
-                    "PutObject",
-                )
-            objects[Key] = (Body, Metadata, ContentType)
+        assert slot.upload is not None
+        self.objects[slot.key] = ObjectMetadata(
+            len(data), media_type, {"sha256": slot.upload.headers["x-amz-meta-sha256"]}
+        )
+        self.bytes[slot.key] = data
 
-    def head(*, Bucket: str, Key: str) -> dict[str, object]:
-        if Key not in objects:
-            raise missing()
-        body, metadata, media_type = objects[Key]
-        return {
-            "ContentLength": len(body),
-            "Metadata": metadata,
-            "ContentType": media_type,
-            "LastModified": modified,
-        }
+    def prefix(self, key: str, maximum: int) -> bytes:
+        self.prefixes.append(key)
+        return self.bytes[key][:maximum]
 
-    def get(*, Bucket: str, Key: str) -> dict[str, object]:
-        if Key not in objects:
-            raise missing()
-        return {"Body": BytesIO(objects[Key][0])}
+    def stream(self, key: str) -> ImageBody:
+        self.reads.append(key)
+        if key not in self.objects:
+            raise ObjectMissing()
+        data = self.bytes[key]
 
-    def delete(*, Bucket: str, Key: str) -> None:
-        objects.pop(Key, None)
+        def chunks() -> Iterator[bytes]:
+            yield data
 
-    def listing(*, Bucket: str, Prefix: str, MaxKeys: int) -> dict[str, object]:
-        return {
-            "Contents": [
-                {"Key": key, "Size": len(value[0]), "LastModified": modified}
-                for key, value in sorted(objects.items())
-                if key.startswith(Prefix)
-            ]
-        }
+        return ImageBody(len(data), chunks(), lambda: None)
 
-    client.put_object.side_effect = put
-    client.head_object.side_effect = head
-    client.get_object.side_effect = get
-    client.delete_object.side_effect = delete
-    client.list_objects_v2.side_effect = listing
-    client.generate_presigned_url.return_value = "https://images.example/signed"
-    return client
+    def delete(self, key: str) -> None:
+        super().delete(key)
+        self.bytes.pop(key, None)

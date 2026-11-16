@@ -5,7 +5,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.accounts import Account
+from app.accounts import Identity
 from app.authentication.errors import (
     AuthenticationError,
     AuthenticationRequired,
@@ -20,10 +20,10 @@ from app.state import scope_resources
 
 async def authenticate_request(
     request: Request, service: AuthenticationService | None
-) -> Account:
+) -> Identity:
     """Accept one Authorization header; never query strings, cookies or account IDs."""
-    existing = getattr(request.state, "authenticated_account", None)
-    if isinstance(existing, Account):
+    existing = getattr(request.state, "authenticated_identity", None)
+    if isinstance(existing, Identity):
         return existing
     values = Headers(scope=request.scope).getlist("authorization")
     if not values:
@@ -36,7 +36,7 @@ async def authenticate_request(
     if service is None:
         raise AuthenticationUnavailable()
     account = await service.authenticate(token)
-    request.state.authenticated_account = account
+    request.state.authenticated_identity = account
     return account
 
 

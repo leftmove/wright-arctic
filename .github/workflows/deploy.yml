@@ -20,16 +20,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Read the pinned native codec
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: leftmove/wright-pacific
-          ref: 1cfa2f501e8f9a57865152ce869da93c74024b9b
-          token: ${{ secrets.WRIGHT_NATIVE_READ_TOKEN }}
-          path: .native-codec
-          persist-credentials: false
-      - name: Use the verified codec checkout for Cargo
-        run: git config --global url."file://${GITHUB_WORKSPACE}/.native-codec".insteadOf https://github.com/leftmove/wright-pacific.git
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.13.4"
